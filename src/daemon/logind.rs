@@ -101,10 +101,7 @@ impl Logind {
 }
 
 /// Polls logind and reports each change of the active session.
-pub fn watch(
-    logind: std::sync::Arc<Logind>,
-    changed: tokio::sync::mpsc::UnboundedSender<Active>,
-) {
+pub fn watch(logind: std::sync::Arc<Logind>, changed: tokio::sync::mpsc::UnboundedSender<Active>) {
     tokio::spawn(async move {
         let mut last: Option<Active> = None;
         let mut warned = false;

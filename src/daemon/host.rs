@@ -16,7 +16,10 @@ use super::{CALL_TIMEOUT, ClipCmd, Effects, Shared};
 use crate::ipc::to_proto;
 
 /// Runs `call` on the active agent, with a timeout.
-async fn on_agent<T, F>(agent: &Arc<Agent>, call: impl FnOnce(crate::ipc::SessionProxy<'static>) -> F) -> Result<T>
+async fn on_agent<T, F>(
+    agent: &Arc<Agent>,
+    call: impl FnOnce(crate::ipc::SessionProxy<'static>) -> F,
+) -> Result<T>
 where
     F: std::future::Future<Output = zbus::Result<T>>,
 {
@@ -117,7 +120,8 @@ impl ClipboardIface {
             .0
             .current()
             .ok_or_else(|| Error::NoData("no session agent".into()))?;
-        let (mime, data) = on_agent(&agent, |p| async move { p.clipboard_request(mimes).await }).await?;
+        let (mime, data) =
+            on_agent(&agent, |p| async move { p.clipboard_request(mimes).await }).await?;
         let max = self.0.max_clipboard.load(Ordering::Relaxed);
         if max >= 0 && data.len() > max as usize {
             return Err(Error::InvalidArgument(format!(

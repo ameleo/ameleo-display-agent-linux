@@ -66,8 +66,8 @@ impl Effects {
                 text.push('\n');
             }
         }
-        let res = std::fs::create_dir_all(STATE_DIR)
-            .and_then(|()| std::fs::write(Self::path(), text));
+        let res =
+            std::fs::create_dir_all(STATE_DIR).and_then(|()| std::fs::write(Self::path(), text));
         if let Err(e) = res {
             tracing::warn!("cannot save the desktop effects: {e}");
         }
@@ -76,7 +76,10 @@ impl Effects {
 
 /// Clipboard requests to the active session agent, in the host's order.
 enum ClipCmd {
-    Grab { serial: u32, mimes: Vec<String> },
+    Grab {
+        serial: u32,
+        mimes: Vec<String>,
+    },
     Release,
     /// The active agent changed.
     Activated {
@@ -223,7 +226,10 @@ impl Shared {
     }
 
     fn add_transfer(&self, agent: Arc<Agent>, id: u32) -> u32 {
-        let ours = self.next_transfer.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let ours = self
+            .next_transfer
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         self.transfers
             .lock()
             .unwrap()
@@ -327,7 +333,8 @@ struct HostSession {
 }
 
 pub async fn run() -> Result<()> {
-    let mouse = mouse::spawn().map_err(|e| anyhow::anyhow!("cannot create the uinput pointer: {e}"))?;
+    let mouse =
+        mouse::spawn().map_err(|e| anyhow::anyhow!("cannot create the uinput pointer: {e}"))?;
     let logind = match logind::Logind::connect().await {
         Ok(l) => Some(Arc::new(l)),
         Err(e) => {
@@ -537,7 +544,10 @@ mod tests {
             .unwrap();
         cb.set_max_size(4096).await.unwrap();
         assert_eq!(cb.max_size().await.unwrap(), 4096);
-        let err = cb.request(vec![proto::mime::TEXT.into()]).await.unwrap_err();
+        let err = cb
+            .request(vec![proto::mime::TEXT.into()])
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("SessionLocked"), "{err}");
 
         let ft = proto::FileTransferProxy::builder(&host)
@@ -558,8 +568,7 @@ mod tests {
         shared.locked.store(false, Ordering::Relaxed);
         let (a, b) = tokio::net::UnixStream::pair().unwrap();
         tokio::spawn(agents::serve(shared.clone(), 1, a));
-        let _agent_conn =
-            crate::session::test_agent(b, Some(vec!["text/plain".into()])).await;
+        let _agent_conn = crate::session::test_agent(b, Some(vec!["text/plain".into()])).await;
         for _ in 0..100 {
             if shared.current().is_some() {
                 break;
@@ -569,7 +578,10 @@ mod tests {
         assert!(shared.current().is_some(), "agent not active");
 
         // The request reaches the agent, whose error kind comes back.
-        let err = cb.request(vec![proto::mime::TEXT.into()]).await.unwrap_err();
+        let err = cb
+            .request(vec![proto::mime::TEXT.into()])
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("NoData"), "{err}");
         assert!(err.to_string().contains("no clipboard access"), "{err}");
 
@@ -595,15 +607,21 @@ mod tests {
         shared.locked.store(false, Ordering::Relaxed);
         let sock = std::env::temp_dir().join(format!("ada-live-{}.sock", std::process::id()));
         agents::listen(shared.clone(), &sock).unwrap();
-        let mut child = tokio::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/ameleo-display-agent"))
-            .arg("session")
-            .env("AMELEO_DISPLAY_AGENT_SOCKET", &sock)
-            .env("AMELEO_DISPLAY_AGENT_LOG", "debug")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+        let mut child = tokio::process::Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/ameleo-display-agent"
+        ))
+        .arg("session")
+        .env("AMELEO_DISPLAY_AGENT_SOCKET", &sock)
+        .env("AMELEO_DISPLAY_AGENT_LOG", "debug")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
         for _ in 0..300 {
-            if shared.current().is_some_and(|a| !a.layout.lock().unwrap().is_empty()) {
+            if shared
+                .current()
+                .is_some_and(|a| !a.layout.lock().unwrap().is_empty())
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -650,6 +668,8 @@ mod tests {
 
         let _ = child.kill().await;
         let _ = std::fs::remove_file(&sock);
-        let _ = std::process::Command::new("wl-copy").arg("--clear").status();
+        let _ = std::process::Command::new("wl-copy")
+            .arg("--clear")
+            .status();
     }
 }

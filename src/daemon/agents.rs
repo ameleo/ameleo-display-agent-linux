@@ -26,7 +26,10 @@ pub struct Agent {
 
 impl Agent {
     pub async fn session(&self) -> SessionProxy<'static> {
-        let conn = self.conn.get().expect("agent registered after its connection");
+        let conn = self
+            .conn
+            .get()
+            .expect("agent registered after its connection");
         SessionProxy::builder(conn)
             .cache_properties(CacheProperties::No)
             .build()
@@ -83,7 +86,11 @@ pub fn listen(shared: Arc<Shared>, path: &std::path::Path) -> std::io::Result<()
     Ok(())
 }
 
-pub(super) async fn serve(shared: Arc<Shared>, id: u64, stream: tokio::net::UnixStream) -> anyhow::Result<()> {
+pub(super) async fn serve(
+    shared: Arc<Shared>,
+    id: u64,
+    stream: tokio::net::UnixStream,
+) -> anyhow::Result<()> {
     let uid = stream.peer_cred()?.uid();
     let agent = Arc::new(Agent {
         id,
@@ -176,8 +183,12 @@ impl DaemonIface {
             .await
             .map_err(|_| Error::Failed(format!("no answer within {CALL_TIMEOUT:?}")))?;
         match &res {
-            Ok((m, d)) => tracing::debug!(took = ?t.elapsed(), mime = m, bytes = d.len(), "host clipboard data"),
-            Err(e) => tracing::warn!(took = ?t.elapsed(), ?mimes, "host clipboard request failed: {e}"),
+            Ok((m, d)) => {
+                tracing::debug!(took = ?t.elapsed(), mime = m, bytes = d.len(), "host clipboard data")
+            }
+            Err(e) => {
+                tracing::warn!(took = ?t.elapsed(), ?mimes, "host clipboard request failed: {e}")
+            }
         }
         res.map_err(|e| Error::NoData(e.to_string()))
     }

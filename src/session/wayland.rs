@@ -247,11 +247,10 @@ macro_rules! data_control {
                         state.offers.insert(id.id(), (Offer::$variant(id), Vec::new()));
                     }
                     E::Selection { id } => state.selection(id.map(|o| o.id())),
-                    E::PrimarySelection { id } => {
-                        if let Some(o) = id {
-                            if let Some((offer, _)) = state.offers.remove(&o.id()) {
-                                offer.destroy();
-                            }
+                    // The primary selection is not shared with the host.
+                    E::PrimarySelection { id: Some(o) } => {
+                        if let Some((offer, _)) = state.offers.remove(&o.id()) {
+                            offer.destroy();
                         }
                     }
                     E::Finished => {
@@ -515,7 +514,8 @@ impl State {
                     let _ = reply.send(Err(format!("{mime} is not offered")));
                     return;
                 }
-                let (read, write) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC) {
+                let (read, write) = match rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+                {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = reply.send(Err(e.to_string()));

@@ -29,9 +29,19 @@ const ABS_MAX: i32 = 32767;
 const WHEEL_DELTA: i32 = 120;
 
 pub enum Cmd {
-    Move { head: u32, x: u32, y: u32 },
-    Button { button: u32, down: bool },
-    Scroll { dx: i32, dy: i32 },
+    Move {
+        head: u32,
+        x: u32,
+        y: u32,
+    },
+    Button {
+        button: u32,
+        down: bool,
+    },
+    Scroll {
+        dx: i32,
+        dy: i32,
+    },
     /// The layout of the active session; empty: none known.
     Layout(Vec<Head>),
     /// The host is gone: release the buttons it left down.
@@ -229,7 +239,10 @@ impl Mouse {
     fn scroll(&mut self, dx: i32, dy: i32) {
         let mut events = Vec::with_capacity(4);
         if dy != 0 {
-            events.push(*RelativeAxisEvent::new(RelativeAxisCode::REL_WHEEL_HI_RES, dy));
+            events.push(*RelativeAxisEvent::new(
+                RelativeAxisCode::REL_WHEEL_HI_RES,
+                dy,
+            ));
             let (clicks, rest) = notches(self.rest.1, dy);
             self.rest.1 = rest;
             if clicks != 0 {
@@ -237,11 +250,17 @@ impl Mouse {
             }
         }
         if dx != 0 {
-            events.push(*RelativeAxisEvent::new(RelativeAxisCode::REL_HWHEEL_HI_RES, dx));
+            events.push(*RelativeAxisEvent::new(
+                RelativeAxisCode::REL_HWHEEL_HI_RES,
+                dx,
+            ));
             let (clicks, rest) = notches(self.rest.0, dx);
             self.rest.0 = rest;
             if clicks != 0 {
-                events.push(*RelativeAxisEvent::new(RelativeAxisCode::REL_HWHEEL, clicks));
+                events.push(*RelativeAxisEvent::new(
+                    RelativeAxisCode::REL_HWHEEL,
+                    clicks,
+                ));
             }
         }
         if !events.is_empty() {
@@ -253,7 +272,11 @@ impl Mouse {
 /// Whole notches in `rest + delta`, and what is left. A change of direction
 /// drops the rest.
 fn notches(rest: i32, delta: i32) -> (i32, i32) {
-    let rest = if rest.signum() * delta.signum() < 0 { 0 } else { rest };
+    let rest = if rest.signum() * delta.signum() < 0 {
+        0
+    } else {
+        rest
+    };
     let total = rest + delta;
     (total / WHEEL_DELTA, total % WHEEL_DELTA)
 }
@@ -415,8 +438,11 @@ mod tests {
             (1, 1920, 0, 1280, 720, 2560, 1440),
         ]);
         assert_eq!(l.size, (3200, 1080));
-        for (px, py, lx, ly) in [(0, 0, 1920, 0), (2559, 1439, 3199, 719), (1280, 720, 2560, 360)]
-        {
+        for (px, py, lx, ly) in [
+            (0, 0, 1920, 0),
+            (2559, 1439, 3199, 719),
+            (1280, 720, 2560, 360),
+        ] {
             let (ax, ay) = l.to_abs(1, px, py).unwrap();
             assert_eq!(ax as u64 * 3200 / 32768, lx, "x of {px}");
             assert_eq!(ay as u64 * 1080 / 32768, ly, "y of {py}");

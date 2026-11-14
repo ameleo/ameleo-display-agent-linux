@@ -41,7 +41,10 @@ pub struct Handle {
 
 impl Handle {
     pub async fn read(&self, mime: &str) -> Result<Vec<u8>, String> {
-        self.shell.get_content(mime).await.map_err(|e| e.to_string())
+        self.shell
+            .get_content(mime)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub async fn set(&self, mime: &str, data: Vec<u8>) -> Result<(), String> {

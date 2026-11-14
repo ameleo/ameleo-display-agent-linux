@@ -20,16 +20,10 @@ pub const GUEST_TEXT: &[&str] = &[
 ];
 
 /// Image types we can read from a guest app, best first.
-const GUEST_IMAGES: &[&str] = &[
-    "image/png",
-    "image/bmp",
-    "image/x-bmp",
-    "image/jpeg",
-];
+const GUEST_IMAGES: &[&str] = &["image/png", "image/bmp", "image/x-bmp", "image/jpeg"];
 
 pub fn is_text(m: &str) -> bool {
-    m.eq_ignore_ascii_case(mime::TEXT)
-        || GUEST_TEXT.iter().any(|t| t.eq_ignore_ascii_case(m))
+    m.eq_ignore_ascii_case(mime::TEXT) || GUEST_TEXT.iter().any(|t| t.eq_ignore_ascii_case(m))
 }
 
 fn is_image(m: &str) -> bool {
@@ -134,10 +128,7 @@ mod tests {
     #[test]
     fn export_types() {
         assert_eq!(exportable(&v(&["UTF8_STRING", "TEXT"])), v(&[mime::TEXT]));
-        assert_eq!(
-            exportable(&v(&["image/jpeg"])),
-            v(&[mime::PNG, mime::BMP])
-        );
+        assert_eq!(exportable(&v(&["image/jpeg"])), v(&[mime::PNG, mime::BMP]));
         assert!(exportable(&v(&["text/uri-list", "x-special/gnome-copied-files"])).is_empty());
     }
 

@@ -63,7 +63,10 @@ impl State {
     /// Tells the host what the guest clipboard holds now.
     async fn announce(&self) {
         let guest = self.guest.lock().unwrap().clone();
-        let exported = guest.as_deref().map(clipboard::exportable).unwrap_or_default();
+        let exported = guest
+            .as_deref()
+            .map(clipboard::exportable)
+            .unwrap_or_default();
         let res = if exported.is_empty() {
             self.daemon().clipboard_released().await
         } else {
@@ -178,7 +181,11 @@ impl SessionIface {
     }
 
     fn set_effects(&self, no_wallpaper: bool, no_font_smoothing: bool, no_animation: bool) {
-        tokio::spawn(effects::apply((no_wallpaper, no_font_smoothing, no_animation)));
+        tokio::spawn(effects::apply((
+            no_wallpaper,
+            no_font_smoothing,
+            no_animation,
+        )));
     }
 
     fn file_start(&self, name: &str, size: u64) -> proto::Result<u32> {

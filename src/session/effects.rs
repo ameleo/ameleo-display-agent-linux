@@ -172,16 +172,25 @@ async fn turn_off(desktop: Desktop, key: &str) -> Result<(), String> {
             let (schema, k, v) = gsettings_key(key);
             output("gsettings", &["set", schema, k, v]).await.map(drop)
         }
-        Desktop::Plasma if key == WALLPAPER => plasma_script(
-            "desktops().forEach(function(d){d.wallpaperPlugin='org.kde.color'})",
-        )
-        .await
-        .map(drop),
+        Desktop::Plasma if key == WALLPAPER => {
+            plasma_script("desktops().forEach(function(d){d.wallpaperPlugin='org.kde.color'})")
+                .await
+                .map(drop)
+        }
         Desktop::Plasma => {
             let (group, k, v) = kdeglobals_key(key);
             output(
                 "kwriteconfig6",
-                &["--notify", "--file", "kdeglobals", "--group", group, "--key", k, v],
+                &[
+                    "--notify",
+                    "--file",
+                    "kdeglobals",
+                    "--group",
+                    group,
+                    "--key",
+                    k,
+                    v,
+                ],
             )
             .await
             .map(drop)
@@ -197,15 +206,25 @@ async fn restore(desktop: Desktop, key: &str, value: &str) -> Result<(), String>
             if value.is_empty() {
                 output("gsettings", &["reset", schema, k]).await.map(drop)
             } else {
-                output("gsettings", &["set", schema, k, value]).await.map(drop)
+                output("gsettings", &["set", schema, k, value])
+                    .await
+                    .map(drop)
             }
         }
-        Desktop::Plasma if key == WALLPAPER => {
-            plasma_script(&restore_wallpaper_script(value)?).await.map(drop)
-        }
+        Desktop::Plasma if key == WALLPAPER => plasma_script(&restore_wallpaper_script(value)?)
+            .await
+            .map(drop),
         Desktop::Plasma => {
             let (group, k, _) = kdeglobals_key(key);
-            let mut args = vec!["--notify", "--file", "kdeglobals", "--group", group, "--key", k];
+            let mut args = vec![
+                "--notify",
+                "--file",
+                "kdeglobals",
+                "--group",
+                group,
+                "--key",
+                k,
+            ];
             if value.is_empty() {
                 args.push("--delete");
             } else {
@@ -252,7 +271,9 @@ trait PlasmaShell {
 
 /// Runs a Plasma script. Plasma may not be up yet at logon: retried.
 async fn plasma_script(script: &str) -> Result<String, String> {
-    let conn = zbus::Connection::session().await.map_err(|e| e.to_string())?;
+    let conn = zbus::Connection::session()
+        .await
+        .map_err(|e| e.to_string())?;
     let shell = PlasmaShellProxy::new(&conn)
         .await
         .map_err(|e| e.to_string())?;
