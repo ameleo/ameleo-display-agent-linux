@@ -1,11 +1,10 @@
 # ameleo-display-agent-linux
 
 A Linux guest agent for QEMU `-display dbus`, written in Rust. It replaces spice-vdagent: the
-host and the agent talk over one virtio-serial port, with a peer-to-peer D-Bus session on it and
-one versioned D-Bus interface per feature, as defined by
-[ameleo-display-protocol](https://github.com/ameleo/ameleo-display-protocol). It is the Linux
-counterpart of
-[ameleo-display-agent-windows](https://github.com/ameleo/ameleo-display-agent-windows).
+host and the agent talk over one virtio-serial port, with a peer-to-peer D-Bus session on it
+and one versioned D-Bus interface per feature, as defined by
+[ameleo-display-protocol](https://github.com/ameleo/ameleo-display-protocol). The Windows
+agent is [ameleo-display-agent-windows](https://github.com/ameleo/ameleo-display-agent-windows).
 
 ## QEMU setup
 
@@ -18,109 +17,34 @@ counterpart of
 The guest sees the port as `/dev/virtio-ports/fr.ameleo.agent.0`. The agent does not use the
 `qemu-vdagent` chardev or the `com.redhat.spice.0` port.
 
-## What it does
+The agent works in Wayland sessions of GNOME (45 or later), Plasma 6 and the wlroots
+compositors. It does not support X11 sessions.
 
-| Interface | Status |
+## Repository layout
+
+The agent is one program, `ameleo-display-agent`, with two roles, as spice-vdagentd and
+spice-vdagent have:
+
+| Role | Role in the guest |
 |---|---|
-| `fr.ameleo.Agent1` | Version, channels, `SessionLocked` (from logind), `Reset()` (also locks the session) |
-| `fr.ameleo.Agent.Mouse1` | Absolute pointer over all monitors, 5 buttons, both wheels with high resolution scrolling |
-| `fr.ameleo.Agent.Clipboard1` | Text, PNG and BMP, both ways |
-| `fr.ameleo.Agent.FileTransfer1` | Files saved in the user's Downloads folder, shown in the file manager |
-| `fr.ameleo.Agent.Display1` | Wallpaper, font smoothing and animations, on GNOME and Plasma |
-| `FileClipboard1`, `Camera1`, `Printer1`, `Drive1` | Not yet: the agent does not list them in `Channels` |
+| `ameleo-display-agent daemon` | The system service, run as root: the port, the host's D-Bus session, the pointer and the session lock |
+| `ameleo-display-agent session` | The session agent, run as the user in each graphical session: the clipboard, the monitor layout, files sent by the host and the desktop effects |
 
-Supported desktops: Wayland sessions of GNOME (45 or later), Plasma 6 and the wlroots
-compositors. X11 sessions are not supported.
-
-## Design
-
-The agent is one program with two roles, like spice-vdagentd and spice-vdagent:
-
-```
-QEMU host ── virtio-serial ── daemon (root) ──── /run/ameleo-display-agent/session.sock
-                               │  uinput pointer          │ peer-to-peer D-Bus
-                               │  logind                  │
-                               └──────────────────── session agent (user, one per session)
-                                                       clipboard, monitors, files, effects
-```
-
-* **`ameleo-display-agent daemon`** runs as root (system service, started by udev when the
-  port appears). It owns the port and serves the host's D-Bus session on it. It injects the
-  pointer through a uinput absolute mouse, and follows the seat0 session through logind: who is
-  in front of the screen, and whether it is locked.
-* **`ameleo-display-agent session`** runs as the user in each graphical session (systemd user
-  service). It connects to the daemon's socket and does what needs the user's desktop.
-
-The daemon serves `fr.ameleo.DisplayAgent.Daemon1` to each session agent, which serves
-`fr.ameleo.DisplayAgent.Session1` back (see `src/ipc.rs`). Only the agent of the user of the
-active seat0 session gets the host's requests; the other users' agents get nothing.
+The modules of `src`, by feature:
 
 | Module | Role |
 |---|---|
-| `channel/` | The virtio-serial port and the D-Bus framing on it (shared with the Windows agent) |
-| `daemon/` | The host's interfaces, the pointer, logind, the session agents |
-| `session/` | The clipboard (Wayland or GNOME Shell), monitors, file transfer, desktop effects |
-| `ipc` | The private contract between the daemon and the session agents |
-| `gnome-shell-extension/` | The clipboard on GNOME |
+| `main`, `ipc` | The entry point, and the private D-Bus interfaces between the daemon and the session agents |
+| `channel/` | The virtio-serial port and the D-Bus sessions on it |
+| `daemon/` | The host's interfaces, the uinput pointer, logind and the session agents |
+| `session/` | The clipboard (Wayland or GNOME Shell), the monitors, file transfer and desktop effects |
 
-## How the agent implements the protocol
-
-### Session and port
-
-The Linux virtio console driver reports the host's side of the port: while the host is away,
-reads return end of file and `poll` returns `POLLHUP`. The daemon takes the first end of file
-after data as a disconnect and resets its D-Bus framer, so a message cut in the middle never
-swallows the next handshake. Like the Windows agent, it also follows the D-Bus framing to spot
-a new handshake, whatever the port says.
-
-### Pointer
-
-The uinput device is an absolute mouse (`ABS_X`/`ABS_Y`, buttons, wheels), like QEMU's USB
-tablet: the compositor maps it to the bounding box of all monitors, in logical coordinates.
-The session agent reads the layout from `wl_output` and `xdg_output`: connector `Virtual-N` is
-scanout `N-1`, the host's `head`. The host's coordinates are in pixels of the head's mode; the
-daemon scales them to the logical size, so HiDPI and fractional scaling work.
-
-Without a session agent (on the login screen), the daemon reads the heads from DRM and puts
-them side by side at scale 1, the compositors' default.
-
-### Clipboard
-
-* **Plasma and wlroots**: the session agent uses `ext-data-control-v1` (or
-  `wlr-data-control-unstable-v1`), which works without a window. Host data is fetched only when
-  a guest app pastes.
-* **GNOME**: Mutter has no data control protocol, so the clipboard goes through the agent's
-  GNOME Shell extension. The extension answers only `/usr/bin/ameleo-display-agent` (or
-  `/usr/local/bin`), so other apps cannot use it to get around Wayland's clipboard rules. The
-  Shell needs the data with the selection: when the host copies, the agent fetches it at once,
-  in one type (text, else PNG).
-* Text is UTF-8 with `\n` on both sides. Images are converted between PNG and BMP when one side
-  has only the other; JPEG copies are exported as PNG.
-* The clipboard is not given out while the session is locked.
-
-### File transfer
-
-Files go to `XDG_DOWNLOAD_DIR` (`~/Downloads`), as the user, named `name (n).ext` when the name
-is taken. The agent checks the free space first and refuses names with `/`, control
-characters, `.` or `..`. An unfinished file is removed. The file manager shows the new file
-(`org.freedesktop.FileManager1.ShowItems`). Transfers are refused while the session is locked.
-
-### Desktop effects
-
-The daemon keeps the host's choice in `/var/lib/ameleo-display-agent/effects`; each session
-agent applies it when it starts, so it holds across reboots and logons. Turning an effect off
-saves the user's own setting first, in
-`~/.local/state/ameleo-display-agent/effects-saved`, and turning it back on restores it.
-
-| Effect | GNOME (`gsettings`) | Plasma |
-|---|---|---|
-| Wallpaper | `org.gnome.desktop.background picture-options 'none'` | Wallpaper plugin `org.kde.color` (Plasma script) |
-| Font smoothing | `org.gnome.desktop.interface font-antialiasing 'none'` | `kdeglobals` `[General] XftAntialias=false` |
-| Animations | `org.gnome.desktop.interface enable-animations false` | `kdeglobals` `[KDE] AnimationDurationFactor=0` |
+`gnome-shell-extension/` holds the GNOME Shell extension that gives the clipboard to the agent
+on GNOME, and `packaging/` the systemd units and the udev rule.
 
 ## Building
 
-With stable Rust (edition 2024):
+With stable Rust:
 
 ```
 make
@@ -128,63 +52,157 @@ make
 
 ## Installing in the guest
 
+Build as yourself, then install as root:
+
 ```
-make                      # build, as yourself
-sudo make deploy          # install, then (re)start the services
+make
+sudo make deploy
 ```
 
-`deploy` installs the files under `/usr` (`PREFIX`), reloads systemd and udev, starts the daemon
-if the agent port is there (or restarts it on the new binary), and enables the session agent
-for every user's graphical session. Run it again after each change.
+`deploy` installs the agent under `/usr` (set `PREFIX` to change it), reloads systemd and udev,
+and enables the session agent for the graphical sessions of every user. Run it again after each
+change: it installs the new binary and restarts the daemon if it is running. `sudo make
+uninstall` removes everything.
 
-* udev starts `ameleo-display-agent.service` whenever the port appears, at boot too; it needs no
-  `enable`, and stops with the port.
-* The session agent starts with each graphical session. `make restart-session` restarts yours
-  on the new binary, without root.
-* On GNOME, enable the extension (for each user, or with a dconf default):
-  `gnome-extensions enable ameleo-display-agent@ameleo.fr`, then log out and in again.
-* `sudo make uninstall` removes everything.
+udev starts the daemon, `ameleo-display-agent.service`, when the agent port appears, at boot
+too, and systemd stops it when the port goes away; the service needs no `enable`. Each graphical
+session starts its session agent, `ameleo-display-agent-session.service`, a systemd user
+service. To restart your own session agent on a new binary, without root, run
+`make restart-session`.
 
-If spice-vdagent is installed, stop and disable it (`spice-vdagentd.service`, and the
+On GNOME, each user must also enable the extension, then log out and in again:
+
+```
+gnome-extensions enable ameleo-display-agent@ameleo.fr
+```
+
+To enable it for all users, add it to the `enabled-extensions` key in a dconf default.
+
+If spice-vdagent is installed, stop and disable it (`spice-vdagentd.service` and the
 `spice-vdagent` autostart entry): both agents would drive the pointer and the clipboard.
 
 ### Debugging
 
+Both roles write their logs to the journal:
+
 ```
-journalctl -u ameleo-display-agent            # the daemon
+journalctl -u ameleo-display-agent
 journalctl --user -u ameleo-display-agent-session
+```
+
+To run the daemon in the foreground, stop the service first, because only one process can open
+the port:
+
+```
+sudo systemctl stop ameleo-display-agent
+sudo AMELEO_DISPLAY_AGENT_LOG=debug ameleo-display-agent daemon
 ```
 
 | Variable | Default | Effect |
 |---|---|---|
 | `AMELEO_DISPLAY_AGENT_LOG` | `info` | The `tracing` filter, such as `debug` or `debug,ameleo_display_agent::daemon::host=trace` (to see pointer events) |
-| `AMELEO_DISPLAY_AGENT_SOCKET` | `/run/ameleo-display-agent/session.sock` | The daemon's socket for the session agents (development) |
+| `AMELEO_DISPLAY_AGENT_SOCKET` | `/run/ameleo-display-agent/session.sock` | The socket between the daemon and the session agents, for development |
 
-Set them with `systemctl edit` (`[Service]` `Environment=...`).
+To set them for the services, use `systemctl edit` and add `Environment=` lines under
+`[Service]`.
 
-### Tests
+`cargo test` runs the unit tests, and a test that goes from a host client, through the D-Bus
+framing, to the daemon and to a session agent. In a Wayland session with wl-clipboard,
+`cargo build && cargo test -- --ignored` also runs the real session agent on the desktop's
+clipboard, in both directions. That test changes the clipboard.
 
-`cargo test` runs the unit tests and an end-to-end test: a host client, through the framer, to
-the daemon, to a session agent. In a Wayland session with wl-clipboard,
-`cargo build && cargo test -- --ignored` also runs the real session agent against the desktop's
-clipboard, both ways (it changes the clipboard).
+## How the agent implements the protocol
+
+[ameleo-display-protocol](https://github.com/ameleo/ameleo-display-protocol) documents the D-Bus
+interfaces for hosts. This section describes how this agent implements them in Linux.
+
+### Daemon and session agents
+
+* **Daemon.** The daemon runs as root. It owns the port, serves the host's D-Bus session on it,
+  and follows the seat0 session through logind: which user is in front of the screen, and
+  whether the session is locked. On `Agent1.Reset`, it locks that session.
+* **Session agents.** Each graphical session runs a session agent as its user. It connects to
+  the daemon on `/run/ameleo-display-agent/session.sock`, with a peer-to-peer D-Bus connection:
+  the daemon serves `fr.ameleo.DisplayAgent.Daemon1`, and the session agent serves
+  `fr.ameleo.DisplayAgent.Session1` (see `src/ipc.rs`).
+* **One user.** The daemon knows the user of each session agent from the socket. Only the agent
+  of the user in front of the screen gets the host's requests; the agents of other users get
+  nothing.
+
+### Port
+
+The Linux virtio console driver reports the host's side of the port: while the host is away,
+reads return the end of the file and `poll` returns `POLLHUP`. The daemon takes the first end of
+the file after data as a disconnection, and starts its D-Bus framing again, so that a message
+cut in the middle cannot swallow the next handshake. As the Windows agent does, it also follows
+the D-Bus framing to see a new handshake, whatever the port reports.
+
+### Pointer
+
+* **Device.** The daemon creates a uinput absolute mouse, as QEMU's USB tablet is: absolute
+  axes, five buttons and both wheels, with high resolution scrolling. The compositor maps it to
+  the bounding box of all monitors, in logical coordinates.
+* **Monitors.** The session agent reads the layout from `wl_output` and `xdg_output`. The
+  connector `Virtual-N` is the virtio-gpu scanout `N-1`, the `head` of the protocol. The host
+  gives pixels of the head's mode, and the daemon scales them to the logical size, so HiDPI and
+  fractional scaling work.
+* **Login screen.** Without a session agent, the daemon reads the heads from DRM and places them
+  side by side at scale 1, as the compositors do by default.
+
+### Clipboard
+
+* **Plasma and wlroots.** The session agent uses `ext-data-control-v1`, or
+  `wlr-data-control-unstable-v1`, which works without a window. It fetches host data only when a
+  guest app pastes it.
+* **GNOME.** Mutter has no data control protocol, so the clipboard goes through the agent's
+  GNOME Shell extension. The extension only answers `/usr/bin/ameleo-display-agent` (or
+  `/usr/local/bin`), so that other apps cannot use it to get around the clipboard rules of
+  Wayland. The Shell needs the data when the selection is set: when the host copies, the agent
+  fetches the data at once, in one format (text if there is any, PNG otherwise).
+* **Formats.** Text is UTF-8 with `\n` line endings on both sides. The agent converts images
+  between PNG and BMP when one side has only one of them, and exports JPEG copies as PNG.
+* **Lock.** The agent does not give out the guest clipboard while the session is locked.
+
+### File transfer
+
+* Files are saved in the user's Downloads folder (`XDG_DOWNLOAD_DIR`), as the user. When the
+  name is taken, the agent adds ` (n)` to it.
+* The agent checks the free space first, and refuses names with `/`, control characters, `.` or
+  `..`. It removes the file of a transfer that does not finish.
+* When the file is complete, the file manager shows it (`org.freedesktop.FileManager1`).
+* Transfers are refused while the session is locked.
+
+### Desktop effects
+
+The daemon keeps the host's choice in `/var/lib/ameleo-display-agent/effects`, and each session
+agent applies it when it starts, so it holds across reboots and is applied again at each logon.
+Before it turns an effect off, the agent saves the user's own setting in
+`~/.local/state/ameleo-display-agent/effects-saved`; turning the effect back on restores that
+setting.
+
+| Effect | GNOME (`gsettings`) | Plasma |
+|---|---|---|
+| Wallpaper | `org.gnome.desktop.background picture-options 'none'` | The `org.kde.color` wallpaper plugin, through a Plasma script |
+| Font smoothing | `org.gnome.desktop.interface font-antialiasing 'none'` | `XftAntialias=false` in `kdeglobals` |
+| Animations | `org.gnome.desktop.interface enable-animations false` | `AnimationDurationFactor=0` in `kdeglobals` |
 
 ## Comparison with spice-vdagent
 
 | spice-vdagent | This agent |
 |---|---|
-| Absolute mouse through uinput, multiple monitors | Same, with the layout of Wayland compositors, HiDPI and fractional scaling, plus the horizontal wheel and high resolution scrolling |
-| Clipboard text and images, X11 and (partly) Wayland | Text, PNG and BMP on Wayland: GNOME, Plasma, wlroots |
-| File transfer to Downloads, `name (n).ext` | Same, with flow control through method replies, and refused while locked |
+| Absolute mouse through uinput, multiple monitors | Same, with the layout of the Wayland compositors, HiDPI and fractional scaling, plus the horizontal wheel and high resolution scrolling |
+| Clipboard text and images, on X11 and partly on Wayland | Text, PNG and BMP on Wayland: GNOME, Plasma and wlroots |
+| File transfer to Downloads, `name (n).ext` | Same, with flow control through method replies; refused while the session is locked |
+| Reset when the client disconnects | `Agent1.Reset()`, which also locks the session, done implicitly on every new session |
 | Monitor configuration | **Left out on purpose**: the layout belongs to the display driver and the compositor |
 | Capability bitmask | Replaced by D-Bus interfaces and introspection |
 
 ## Not supported yet
 
-* The file clipboard (`FileClipboard1`), client cameras, printers and drives.
-* X11 sessions.
-* The clipboard on the login screen.
-* Distribution packages (RPM, deb).
+* The file clipboard (`FileClipboard1`), client cameras, client printers and client drives. The
+  agent does not list them in `Agent1.Channels`.
+* X11 sessions, and the clipboard on the login screen.
+* Distribution packages (RPM and deb).
 
 ## License
 
