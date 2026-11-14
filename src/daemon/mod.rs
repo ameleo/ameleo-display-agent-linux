@@ -23,7 +23,8 @@ use crate::channel::port::{Port, PortEvent};
 use crate::channel::transport;
 use agents::Agent;
 use host::{
-    AgentIface, ClipboardIface, DisplayIface, FileClipboardIface, FileTransferIface, MouseIface,
+    AgentIface, CameraIface, ClipboardIface, DisplayIface, FileClipboardIface, FileTransferIface,
+    MouseIface,
 };
 use mouse::MouseHandle;
 
@@ -76,6 +77,21 @@ impl Effects {
     }
 }
 
+/// A client camera, kept to be given to the next active agent.
+pub struct CameraInfo {
+    pub name: String,
+    pub formats: Vec<(u32, u32, u32, u32)>,
+    /// An app of the active session uses it.
+    pub streaming: bool,
+}
+
+/// What a camera tells the host.
+pub enum CameraSignal {
+    /// `StreamRequested(format)`, or `StreamStopped`.
+    Stream(Option<u32>),
+    KeyFrame,
+}
+
 /// Clipboard requests to the active session agent, in the host's order.
 enum ClipCmd {
     Grab {
@@ -116,6 +132,8 @@ pub struct Shared {
     /// another one would say nothing new. Cleared when the host session or
     /// the active agent changes, so that a real change is always sent.
     guest_released: AtomicBool,
+    /// The client cameras, by id.
+    cameras: Mutex<std::collections::BTreeMap<u32, CameraInfo>>,
     effects: Mutex<Effects>,
     transfers: Mutex<HashMap<u32, Transfer>>,
     next_transfer: AtomicU32,
@@ -142,6 +160,7 @@ impl Shared {
             host: Mutex::new(None),
             host_grab: Mutex::new(None),
             guest_released: AtomicBool::new(false),
+            cameras: Mutex::new(Default::default()),
             effects: Mutex::new(Effects::load()),
             transfers: Mutex::new(HashMap::new()),
             next_transfer: AtomicU32::new(0),
@@ -163,6 +182,8 @@ impl Shared {
     pub fn reset(&self) {
         *self.host_grab.lock().unwrap() = None;
         self.transfers.lock().unwrap().clear();
+        // The agents remove theirs with the reset.
+        self.cameras.lock().unwrap().clear();
         self.max_clipboard.store(-1, Ordering::Relaxed);
         self.mouse.send(mouse::Cmd::ReleaseAll);
         for agent in self.agents.lock().unwrap().iter() {
@@ -254,6 +275,33 @@ impl Shared {
     }
 
     /// Tells the host that `SessionLocked` changed.
+    /// Sends a camera signal to the host.
+    async fn emit_camera(&self, id: u32, signal: CameraSignal) {
+        let Some(conn) = self.host() else { return };
+        let Ok(iface) = conn
+            .object_server()
+            .interface::<_, CameraIface>(AGENT_PATH)
+            .await
+        else {
+            return;
+        };
+        let e = iface.signal_emitter();
+        let res = match signal {
+            CameraSignal::Stream(Some(format)) => {
+                tracing::info!(id, format, "signal StreamRequested sent to the host");
+                CameraIface::stream_requested(e, id, format).await
+            }
+            CameraSignal::Stream(None) => {
+                tracing::info!(id, "signal StreamStopped sent to the host");
+                CameraIface::stream_stopped(e, id).await
+            }
+            CameraSignal::KeyFrame => CameraIface::key_frame_needed(e, id).await,
+        };
+        if let Err(err) = res {
+            tracing::warn!(id, "cannot send the camera signal: {err}");
+        }
+    }
+
     async fn emit_locked(&self) {
         let Some(conn) = self.host() else { return };
         if let Ok(iface) = conn
@@ -324,6 +372,30 @@ async fn clip_forwarder(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Cli
             ClipCmd::Activated { old, new } => {
                 if let Some(old) = old {
                     let _ = old.session().await.clipboard_release().await;
+                    let _ = old.camera().camera_remove_all().await;
+                }
+                // The cameras move to the new user's session: its apps
+                // have not started them yet.
+                let cameras: Vec<_> = {
+                    let mut cams = shared.cameras.lock().unwrap();
+                    cams.iter_mut()
+                        .map(|(&id, c)| {
+                            let was = std::mem::take(&mut c.streaming);
+                            (id, c.name.clone(), c.formats.clone(), was)
+                        })
+                        .collect()
+                };
+                for (id, _, _, was) in &cameras {
+                    if *was {
+                        shared.emit_camera(*id, CameraSignal::Stream(None)).await;
+                    }
+                }
+                if let Some(new) = &new {
+                    for (id, name, formats, _) in cameras {
+                        if let Err(e) = new.camera().camera_add(id, &name, formats).await {
+                            tracing::warn!(id, agent = new.id, "camera not added: {e}");
+                        }
+                    }
                 }
                 let Some(new) = new else { continue };
                 let grab = shared.host_grab.lock().unwrap().clone();
@@ -472,6 +544,7 @@ async fn build(split: transport::Split, shared: Arc<Shared>) -> zbus::Result<Con
         .serve_at(AGENT_PATH, MouseIface(shared.clone()))?
         .serve_at(AGENT_PATH, ClipboardIface(shared.clone()))?
         .serve_at(AGENT_PATH, FileClipboardIface(shared.clone()))?
+        .serve_at(AGENT_PATH, CameraIface(shared.clone()))?
         .serve_at(AGENT_PATH, DisplayIface(shared.clone()))?
         .serve_at(AGENT_PATH, FileTransferIface(shared))?
         .build()
@@ -642,6 +715,22 @@ mod tests {
         // Bad names are refused by the agent, as InvalidArgument.
         let err = ft.start("../x", 1).await.unwrap_err();
         assert!(err.to_string().contains("InvalidArgument"), "{err}");
+
+        // Camera formats are checked before anything is created.
+        let cam = proto::CameraProxy::builder(&host)
+            .cache_properties(cache)
+            .build()
+            .await
+            .unwrap();
+        for formats in [
+            vec![],
+            vec![(641, 480, 30, 1)],
+            vec![(7680, 4320, 30, 1)],
+            vec![(640, 480, 0, 1)],
+        ] {
+            let err = cam.add_camera(1, "bad", formats).await.unwrap_err();
+            assert!(err.to_string().contains("InvalidArgument"), "{err}");
+        }
     }
 
     #[tokio::test]
@@ -705,6 +794,10 @@ mod tests {
         // by its full path.
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("WAYLAND_DISPLAY", &wayland)
+        .env(
+            "PIPEWIRE_RUNTIME_DIR",
+            std::env::var_os("XDG_RUNTIME_DIR").unwrap(),
+        )
         .env("AMELEO_DISPLAY_AGENT_LOG", "debug")
         .kill_on_drop(true)
         .spawn()
@@ -778,6 +871,72 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&paths[0]).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o644);
+
+        // A client camera, opened by an app through PipeWire.
+        let cam = proto::CameraProxy::builder(&host)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .unwrap();
+        let mut requested = cam.receive_stream_requested().await.unwrap();
+        let mut stopped = cam.receive_stream_stopped().await.unwrap();
+        cam.add_camera(5, "ameleo live test camera", vec![(320, 240, 30, 1)])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let received = runtime.join("camera.i420");
+        let mut app = tokio::process::Command::new("gst-launch-1.0")
+            .args([
+                "-q",
+                "pipewiresrc",
+                "target-object=ameleo-camera-5",
+                // What camera apps say about their stream: WirePlumber
+                // only gives a video source to a video stream.
+                "stream-properties=props,media.type=Video,media.category=Capture,media.role=Camera",
+                "num-buffers=10",
+                "!",
+                "filesink",
+                &format!("location={}", received.display()),
+            ])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let sig = tokio::time::timeout(Duration::from_secs(5), requested.next())
+            .await
+            .expect("StreamRequested")
+            .unwrap();
+        let args = sig.args().unwrap();
+        assert_eq!((args.id, args.format), (5, 0));
+        // The host's stream: H.264 from the same library.
+        let api = crate::session::camera::load_openh264().unwrap();
+        let mut encoder = openh264::encoder::Encoder::with_api_config(
+            api,
+            openh264::encoder::EncoderConfig::new(),
+        )
+        .unwrap();
+        let picture = openh264::formats::YUVBuffer::new(320, 240);
+        let done = async {
+            loop {
+                let au = encoder.encode(&picture).unwrap().to_vec();
+                cam.push_frame(5, 0, au).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+        };
+        let status = tokio::select! {
+            s = app.wait() => s.unwrap(),
+            _ = done => unreachable!(),
+            _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("no pictures reached the app"),
+        };
+        assert!(status.success(), "{status}");
+        // Ten whole decoded pictures, not empty buffers.
+        let pictures = std::fs::read(&received).unwrap();
+        assert_eq!(pictures.len(), 10 * 320 * 240 * 3 / 2);
+        let sig = tokio::time::timeout(Duration::from_secs(5), stopped.next())
+            .await
+            .expect("StreamStopped")
+            .unwrap();
+        assert_eq!(sig.args().unwrap().id, 5);
+        cam.remove_camera(5).await.unwrap();
 
         // Guest files copied for the host.
         let dir = std::env::temp_dir().join(format!("ada-live-files-{}", std::process::id()));

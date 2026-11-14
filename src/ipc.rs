@@ -107,12 +107,40 @@ pub trait Daemon {
         clip_data_id: u32,
         has_clip_data_id: bool,
     ) -> zbus::Result<Vec<u8>>;
+    /// An app started client camera `id` in `format` (index into its
+    /// formats), or stopped it (`-1`).
+    fn camera_stream(&self, id: u32, format: i32) -> zbus::Result<()>;
+    /// The decoder of camera `id` needs an IDR.
+    fn camera_key_frame(&self, id: u32) -> zbus::Result<()>;
     /// A guest app pastes host data: `Host.Clipboard1.Request`.
     fn host_clipboard_request(
         &self,
         serial: u32,
         mimes: Vec<String>,
     ) -> zbus::Result<(String, Vec<u8>)>;
+}
+
+/// The client cameras of the session agent, on [`SESSION_PATH`]. Its own
+/// interface, served in call order: frames must not overtake each other.
+#[zbus::proxy(
+    interface = "fr.ameleo.DisplayAgent.Camera1",
+    default_service = "fr.ameleo.DisplayAgent.Session",
+    default_path = "/fr/ameleo/DisplayAgent/Session",
+    gen_blocking = false
+)]
+pub trait SessionCamera {
+    /// `formats`: `(width, height, fps numerator, fps denominator)`.
+    fn camera_add(
+        &self,
+        id: u32,
+        name: &str,
+        formats: Vec<(u32, u32, u32, u32)>,
+    ) -> zbus::Result<()>;
+    fn camera_remove(&self, id: u32) -> zbus::Result<()>;
+    fn camera_remove_all(&self) -> zbus::Result<()>;
+    /// One H.264 access unit.
+    #[zbus(no_reply)]
+    fn camera_frame(&self, id: u32, data: Vec<u8>) -> zbus::Result<()>;
 }
 
 /// An error of the other side, as the protocol error it was.

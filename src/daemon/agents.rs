@@ -13,13 +13,15 @@ use tokio::net::UnixListener;
 use zbus::Connection;
 use zbus::proxy::CacheProperties;
 
-use super::{CALL_TIMEOUT, Effects, Shared};
-use crate::ipc::{DAEMON_PATH, Head, SessionProxy};
+use super::{CALL_TIMEOUT, CameraSignal, Effects, Shared};
+use crate::ipc::{DAEMON_PATH, Head, SessionCameraProxy, SessionProxy};
 
 pub struct Agent {
     pub id: u64,
     pub uid: u32,
     conn: OnceLock<Connection>,
+    /// Its cameras, built once: a frame is sent per proxy call.
+    camera: OnceLock<SessionCameraProxy<'static>>,
     /// The monitors of its session.
     pub layout: Mutex<Vec<Head>>,
 }
@@ -35,6 +37,12 @@ impl Agent {
             .build()
             .await
             .expect("static proxy parameters")
+    }
+
+    pub fn camera(&self) -> &SessionCameraProxy<'static> {
+        self.camera
+            .get()
+            .expect("agent registered after its connection")
     }
 
     pub fn send_effects(self: &Arc<Self>, e: Effects) {
@@ -96,6 +104,7 @@ pub(super) async fn serve(
         id,
         uid,
         conn: OnceLock::new(),
+        camera: OnceLock::new(),
         layout: Mutex::new(Vec::new()),
     });
     let conn = zbus::connection::Builder::unix_stream(stream)
@@ -111,6 +120,11 @@ pub(super) async fn serve(
         .build()
         .await?;
     let _ = agent.conn.set(conn.clone());
+    let camera = SessionCameraProxy::builder(&conn)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await?;
+    let _ = agent.camera.set(camera);
     tracing::info!(agent = id, uid, "session agent connected");
 
     agent.send_effects(*shared.effects.lock().unwrap());
@@ -215,6 +229,25 @@ impl DaemonIface {
             has_clip_data_id,
         ))
         .await
+    }
+
+    async fn camera_stream(&self, id: u32, format: i32) {
+        if !self.is_current() {
+            return;
+        }
+        let format = u32::try_from(format).ok();
+        if let Some(cam) = self.shared.cameras.lock().unwrap().get_mut(&id) {
+            cam.streaming = format.is_some();
+        }
+        self.shared
+            .emit_camera(id, CameraSignal::Stream(format))
+            .await;
+    }
+
+    async fn camera_key_frame(&self, id: u32) {
+        if self.is_current() {
+            self.shared.emit_camera(id, CameraSignal::KeyFrame).await;
+        }
     }
 
     async fn host_clipboard_request(

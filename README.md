@@ -37,18 +37,23 @@ The modules of `src`, by feature:
 | `main`, `ipc` | The entry point, and the private D-Bus interfaces between the daemon and the session agents |
 | `channel/` | The virtio-serial port and the D-Bus sessions on it |
 | `daemon/` | The host's interfaces, the uinput pointer, logind and the session agents |
-| `session/` | The clipboard (Wayland or GNOME Shell), the file clipboard, the monitors, file transfer and desktop effects |
+| `session/` | The clipboard (Wayland or GNOME Shell), the file clipboard, the client cameras (PipeWire), the monitors, file transfer and desktop effects |
 
 `gnome-shell-extension/` holds the GNOME Shell extension that gives the clipboard to the agent
 on GNOME, and `packaging/` the systemd units and the udev rule.
 
 ## Building
 
-With stable Rust:
+With stable Rust, PipeWire's development files and libclang (Fedora: `pipewire-devel` and
+`clang`; Debian and Ubuntu: `libpipewire-0.3-dev` and `clang`):
 
 ```
 make
 ```
+
+At run time, the client cameras need PipeWire and the Cisco OpenH264 library (Fedora: the
+`openh264` package, from the `fedora-cisco-openh264` repository that Fedora enables by default),
+version 2.6 or later. Without it, the agent works, but `AddCamera` fails.
 
 ## Installing in the guest
 
@@ -185,6 +190,29 @@ host that bridges an RDP client passes them on as they are.
 
 Without FUSE (`/dev/fuse` and `fusermount3`), host files cannot be pasted; the rest works.
 
+### Cameras
+
+Each client camera becomes a PipeWire camera of the user's session, named after the client
+camera: a node of class `Video/Source` and role `Camera`. The apps that use cameras through
+PipeWire or the camera portal list it, such as Firefox, Chromium, OBS and GNOME Snapshot.
+
+* **Formats.** The node offers the formats of `AddCamera` as raw I420 video. When an app starts
+  the camera, the agent sends `StreamRequested` with the format the app chose; when the last app
+  stops it, `StreamStopped`. Apps often pause and start again while they settle on a format: a
+  stop is told to the host only after half a second.
+* **Decoding.** The agent decodes the H.264 stream in the guest with the system's Cisco OpenH264
+  library, loaded at run time, so that no codec is built into the agent. Each picture drives the
+  node at the client's frame rate. When the decoder lost track (a stream that does not start on
+  an IDR, or a frame dropped because the decoder is behind), the agent sends `KeyFrameNeeded`,
+  at most once a second.
+* **Sessions.** The cameras are in the session of the user in front of the screen. When another
+  user's session becomes active, they move to it, and the host is told that they stopped.
+* **Apps that use V4L2 directly.** Apps that open `/dev/video*` themselves do not see PipeWire
+  cameras. PipeWire's `pw-v4l2` wrapper gives them the PipeWire cameras:
+  `pw-v4l2 <app>`.
+* **Controls.** The agent accepts `SetControls` and `ControlValue`, but does not show the camera
+  controls in the guest yet.
+
 ### File transfer
 
 * Files are saved in the user's Downloads folder (`XDG_DOWNLOAD_DIR`), as the user. When the
@@ -222,8 +250,8 @@ setting.
 
 ## Not supported yet
 
-* Client cameras, client printers and client drives. The agent does not list them in
-  `Agent1.Channels`.
+* Client printers and client drives. The agent does not list them in `Agent1.Channels`.
+* Camera controls (brightness, focus, zoom...) in the guest.
 * X11 sessions, and the clipboard on the login screen.
 * Distribution packages (RPM and deb).
 

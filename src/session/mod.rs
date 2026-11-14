@@ -5,6 +5,7 @@
 //! desktop: the clipboard, the monitor layout, files sent by the host,
 //! desktop effects.
 
+pub(crate) mod camera;
 mod clipboard;
 mod effects;
 pub(crate) mod filelist;
@@ -67,6 +68,8 @@ struct State {
     pasted: tokio::sync::Mutex<Option<(u32, Vec<PathBuf>)>>,
     /// The next `LockClipData` id for the host's lists.
     next_lock: AtomicU32,
+    /// The client cameras; unset without PipeWire.
+    cameras: OnceLock<camera::Cameras>,
 }
 
 impl State {
@@ -83,6 +86,7 @@ impl State {
             host_files: OnceLock::new(),
             pasted: tokio::sync::Mutex::new(None),
             next_lock: AtomicU32::new(0),
+            cameras: OnceLock::new(),
         }
     }
 
@@ -377,7 +381,52 @@ impl SessionIface {
         if let Some(files) = self.0.host_files.get() {
             files.clear();
         }
+        if let Some(cameras) = self.0.cameras.get() {
+            cameras.remove_all();
+        }
         self.clipboard_release().await;
+    }
+}
+
+struct CameraIface(Arc<State>);
+
+/// `spawn = false`: calls are handled in arrival order, so frames never
+/// overtake each other. Only `CameraAdd` waits, briefly, for PipeWire.
+#[zbus::interface(name = "fr.ameleo.DisplayAgent.Camera1", spawn = false)]
+impl CameraIface {
+    async fn camera_add(
+        &self,
+        id: u32,
+        name: &str,
+        formats: Vec<(u32, u32, u32, u32)>,
+    ) -> proto::Result<()> {
+        let cameras = self
+            .0
+            .cameras
+            .get()
+            .ok_or_else(|| Error::Failed("no PipeWire in this session".into()))?;
+        cameras
+            .add(id, name.to_string(), formats)
+            .await
+            .map_err(Error::Failed)
+    }
+
+    fn camera_remove(&self, id: u32) {
+        if let Some(cameras) = self.0.cameras.get() {
+            cameras.remove(id);
+        }
+    }
+
+    fn camera_remove_all(&self) {
+        if let Some(cameras) = self.0.cameras.get() {
+            cameras.remove_all();
+        }
+    }
+
+    fn camera_frame(&self, id: u32, data: Vec<u8>) {
+        if let Some(cameras) = self.0.cameras.get() {
+            cameras.push(id, data);
+        }
     }
 }
 
@@ -503,11 +552,19 @@ pub async fn run() -> Result<()> {
         Clip::None
     };
     let state = Arc::new(State::new(clip, None));
+    let (camera_tx, mut camera_events) = mpsc::unbounded_channel();
+    match camera::Cameras::spawn(camera_tx) {
+        Ok(c) => {
+            let _ = state.cameras.set(c);
+        }
+        Err(e) => tracing::warn!("no client cameras: {e:#}"),
+    }
 
     let stream = connect_daemon().await;
     let conn = zbus::connection::Builder::unix_stream(stream)
         .p2p()
         .serve_at(SESSION_PATH, SessionIface(state.clone()))?
+        .serve_at(SESSION_PATH, CameraIface(state.clone()))?
         .build()
         .await?;
     let daemon = DaemonProxy::builder(&conn)
@@ -518,6 +575,7 @@ pub async fn run() -> Result<()> {
     tracing::info!("connected to the daemon");
     mount_host_files(&state, daemon);
 
+    let mut streams = CameraStreams::default();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
@@ -538,10 +596,69 @@ pub async fn run() -> Result<()> {
                     tokio::spawn(paste(state.clone(), mime, fd));
                 }
             },
+            Some(ev) = camera_events.recv() => match ev {
+                camera::Event::Stream { id, format } => {
+                    streams.change(id, format, &state);
+                }
+                camera::Event::KeyFrame { id } => {
+                    if let Err(e) = state.daemon().camera_key_frame(id).await {
+                        tracing::warn!("cannot send a camera event: {e}");
+                    }
+                }
+            },
             _ = conn.closed() => anyhow::bail!("the daemon closed the connection"),
             _ = sigterm.recv() => {
                 tracing::info!("stopping");
                 return Ok(());
+            }
+        }
+    }
+}
+
+/// How long a camera stays started after its app paused it: apps pause and
+/// start again while they settle on a format, the host need not know.
+const STREAM_STOP_DELAY: Duration = Duration::from_millis(500);
+
+/// The camera stream states told to the host, with a delay on stops.
+#[derive(Default)]
+struct CameraStreams {
+    /// The format the host was told, per camera.
+    told: Arc<Mutex<std::collections::HashMap<u32, u32>>>,
+    /// Stops not told yet.
+    pending: std::collections::HashMap<u32, tokio::task::JoinHandle<()>>,
+}
+
+impl CameraStreams {
+    fn change(&mut self, id: u32, format: Option<u32>, state: &Arc<State>) {
+        if let Some(stop) = self.pending.remove(&id) {
+            stop.abort();
+        }
+        let told = self.told.clone();
+        let state = state.clone();
+        match format {
+            Some(f) => {
+                if told.lock().unwrap().insert(id, f) == Some(f) {
+                    return; // started again in the same format
+                }
+                tokio::spawn(async move {
+                    tracing::info!(id, format = f, "camera stream started");
+                    if let Err(e) = state.daemon().camera_stream(id, f as i32).await {
+                        tracing::warn!("cannot send a camera event: {e}");
+                    }
+                });
+            }
+            None => {
+                let stop = tokio::spawn(async move {
+                    tokio::time::sleep(STREAM_STOP_DELAY).await;
+                    if told.lock().unwrap().remove(&id).is_none() {
+                        return;
+                    }
+                    tracing::info!(id, "camera stream stopped");
+                    if let Err(e) = state.daemon().camera_stream(id, -1).await {
+                        tracing::warn!("cannot send a camera event: {e}");
+                    }
+                });
+                self.pending.insert(id, stop);
             }
         }
     }

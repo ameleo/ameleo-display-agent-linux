@@ -50,6 +50,7 @@ impl AgentIface {
             iface::CLIPBOARD,
             iface::FILE_CLIPBOARD,
             iface::DISPLAY,
+            iface::CAMERA,
             iface::FILE_TRANSFER,
         ]
         .into_iter()
@@ -219,6 +220,147 @@ impl FileClipboardIface {
         }
         res
     }
+}
+
+pub struct CameraIface(pub Arc<Shared>);
+
+/// Longest wait for a session agent to create a camera: the host's calls
+/// wait behind it (`spawn = false`).
+const CAMERA_ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Formats per camera.
+const MAX_FORMATS: usize = 16;
+
+/// Checks the formats of `AddCamera`.
+pub fn check_formats(formats: &[(u32, u32, u32, u32)]) -> Result<()> {
+    use proto::camera::{MAX_HEIGHT, MAX_WIDTH};
+    if formats.is_empty() || formats.len() > MAX_FORMATS {
+        return Err(Error::InvalidArgument(format!(
+            "1 to {MAX_FORMATS} formats"
+        )));
+    }
+    let bad = |&(w, h, num, den): &(u32, u32, u32, u32)| {
+        w == 0
+            || h == 0
+            || w > MAX_WIDTH
+            || h > MAX_HEIGHT
+            || w % 2 != 0
+            || h % 2 != 0
+            || num == 0
+            || den == 0
+    };
+    if let Some(f) = formats.iter().find(|f| bad(f)) {
+        return Err(Error::InvalidArgument(format!("unsupported format {f:?}")));
+    }
+    Ok(())
+}
+
+/// Client cameras: shown in the active session, through PipeWire.
+/// `spawn = false`: frames are passed on in the order they came.
+#[zbus::interface(name = "fr.ameleo.Agent.Camera1", spawn = false)]
+impl CameraIface {
+    async fn add_camera(
+        &self,
+        id: u32,
+        name: &str,
+        formats: Vec<(u32, u32, u32, u32)>,
+    ) -> Result<()> {
+        tracing::info!(id, name, ?formats, "AddCamera");
+        check_formats(&formats)?;
+        {
+            let mut cams = self.0.cameras.lock().unwrap();
+            if !cams.contains_key(&id) && cams.len() >= proto::camera::MAX_CAMERAS as usize {
+                return Err(Error::Failed(format!(
+                    "at most {} cameras",
+                    proto::camera::MAX_CAMERAS
+                )));
+            }
+            cams.insert(
+                id,
+                super::CameraInfo {
+                    name: name.to_string(),
+                    formats: formats.clone(),
+                    streaming: false,
+                },
+            );
+        }
+        // Without a user session, the camera comes with the next one.
+        let Some(agent) = self.0.current() else {
+            return Ok(());
+        };
+        let res = tokio::time::timeout(
+            CAMERA_ADD_TIMEOUT,
+            agent.camera().camera_add(id, name, formats),
+        )
+        .await
+        .map_err(|_| Error::Failed("the session agent did not answer".into()))
+        .and_then(|r| r.map_err(to_proto));
+        if res.is_err() {
+            self.0.cameras.lock().unwrap().remove(&id);
+        }
+        res
+    }
+
+    async fn remove_camera(&self, id: u32) {
+        tracing::info!(id, "RemoveCamera");
+        let was = self.0.cameras.lock().unwrap().remove(&id);
+        if let Some(agent) = self.0.current() {
+            let _ = agent.camera().camera_remove(id).await;
+        } else if was.is_some_and(|c| c.streaming) {
+            self.0
+                .emit_camera(id, super::CameraSignal::Stream(None))
+                .await;
+        }
+    }
+
+    async fn push_frame(&self, id: u32, _timestamp_us: u64, data: Vec<u8>) {
+        if let Some(agent) = self.0.current() {
+            let _ = agent.camera().camera_frame(id, data).await;
+        }
+    }
+
+    /// The controls are not shown in the guest yet: taken and ignored.
+    fn set_controls(&self, id: u32, controls: Vec<proto::camera_control::Control>) -> Result<()> {
+        if !self.0.cameras.lock().unwrap().contains_key(&id) {
+            return Err(Error::InvalidArgument(format!("no camera {id}")));
+        }
+        if controls.len() > proto::camera_control::MAX_CONTROLS {
+            return Err(Error::InvalidArgument(format!(
+                "at most {} controls",
+                proto::camera_control::MAX_CONTROLS
+            )));
+        }
+        tracing::debug!(
+            id,
+            count = controls.len(),
+            "camera controls (not shown yet)"
+        );
+        Ok(())
+    }
+
+    fn control_value(&self, _id: u32, _set: u8, _property: u8, _mode: u8, _value: i32) {}
+
+    #[zbus(signal)]
+    pub async fn stream_requested(
+        emitter: &SignalEmitter<'_>,
+        id: u32,
+        format: u32,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    pub async fn stream_stopped(emitter: &SignalEmitter<'_>, id: u32) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    pub async fn key_frame_needed(emitter: &SignalEmitter<'_>, id: u32) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    pub async fn control_requested(
+        emitter: &SignalEmitter<'_>,
+        id: u32,
+        set: u8,
+        property: u8,
+        mode: u8,
+        value: i32,
+    ) -> zbus::Result<()>;
 }
 
 pub struct DisplayIface(pub Arc<Shared>);
