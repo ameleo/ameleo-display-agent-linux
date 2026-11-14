@@ -7,6 +7,12 @@
 //! compositor as an absolute pointer, which KWin, Mutter and wlroots map to
 //! the bounding box of all monitors, in logical coordinates.
 //!
+//! The kernel's joystick driver leaves alone an absolute mouse whose buttons
+//! are exactly left, middle and right (and which declares `EV_MSC` when it
+//! has relative axes): otherwise the pointer would also show up as a
+//! joystick (`/dev/input/js*`) in games. So the side and extra buttons are
+//! on a second device, a plain relative mouse that never moves.
+//!
 //! The host addresses a head (virtio-gpu scanout index) in pixels. The
 //! session agent reports where the compositor put each head and at which
 //! scale ([`crate::ipc::Head`]). Without a session agent (greeter), the
@@ -18,7 +24,7 @@ use std::sync::mpsc;
 use evdev::uinput::VirtualDevice;
 use evdev::{
     AbsInfo, AbsoluteAxisCode, AbsoluteAxisEvent, AttributeSet, BusType, InputEvent, InputId,
-    KeyCode, KeyEvent, RelativeAxisCode, RelativeAxisEvent, UinputAbsSetup,
+    KeyCode, KeyEvent, MiscCode, RelativeAxisCode, RelativeAxisEvent, UinputAbsSetup,
 };
 use proto::Button;
 
@@ -65,25 +71,30 @@ impl MouseHandle {
 
 /// Starts the pointer thread. Fails when uinput is not available.
 pub fn spawn() -> std::io::Result<MouseHandle> {
-    let device = create_device()?;
+    let devices = Devices {
+        pointer: create_pointer()?,
+        buttons: create_buttons()?,
+    };
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("mouse".into())
-        .spawn(move || run(Mouse::new(device), rx))?;
+        .spawn(move || run(Mouse::new(devices), rx))?;
     Ok(MouseHandle(tx))
 }
 
-fn create_device() -> std::io::Result<VirtualDevice> {
-    let mut keys = AttributeSet::<KeyCode>::new();
-    for k in [
-        KeyCode::BTN_LEFT,
-        KeyCode::BTN_RIGHT,
-        KeyCode::BTN_MIDDLE,
-        KeyCode::BTN_SIDE,
-        KeyCode::BTN_EXTRA,
-    ] {
-        keys.insert(k);
+fn key_set(keys: &[KeyCode]) -> AttributeSet<KeyCode> {
+    let mut set = AttributeSet::new();
+    for &k in keys {
+        set.insert(k);
     }
+    set
+}
+
+/// The absolute mouse: the position, the three main buttons and the wheels.
+fn create_pointer() -> std::io::Result<VirtualDevice> {
+    let keys = key_set(POINTER_BUTTONS);
+    let mut msc = AttributeSet::<MiscCode>::new();
+    msc.insert(MiscCode::MSC_SCAN);
     let mut rel = AttributeSet::<RelativeAxisCode>::new();
     for r in [
         RelativeAxisCode::REL_WHEEL,
@@ -99,9 +110,33 @@ fn create_device() -> std::io::Result<VirtualDevice> {
         .input_id(InputId::new(BusType::BUS_VIRTUAL, 0, 0, 1))
         .with_keys(&keys)?
         .with_relative_axes(&rel)?
+        .with_msc(&msc)?
         .with_absolute_axis(&abs(AbsoluteAxisCode::ABS_X))?
         .with_absolute_axis(&abs(AbsoluteAxisCode::ABS_Y))?
         .build()
+}
+
+/// The side and extra buttons. `BTN_LEFT` and the relative axes make it a
+/// mouse for udev and libinput; it only ever sends its two buttons.
+fn create_buttons() -> std::io::Result<VirtualDevice> {
+    let keys = key_set(&[KeyCode::BTN_LEFT, KeyCode::BTN_SIDE, KeyCode::BTN_EXTRA]);
+    let mut rel = AttributeSet::<RelativeAxisCode>::new();
+    rel.insert(RelativeAxisCode::REL_X);
+    rel.insert(RelativeAxisCode::REL_Y);
+    VirtualDevice::builder()?
+        .name("ameleo-display-agent buttons")
+        .input_id(InputId::new(BusType::BUS_VIRTUAL, 0, 0, 1))
+        .with_keys(&keys)?
+        .with_relative_axes(&rel)?
+        .build()
+}
+
+/// The buttons of the absolute mouse: exactly these, see the module docs.
+const POINTER_BUTTONS: &[KeyCode] = &[KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE];
+
+struct Devices {
+    pointer: VirtualDevice,
+    buttons: VirtualDevice,
 }
 
 fn run(mut mouse: Mouse, rx: mpsc::Receiver<Cmd>) {
@@ -131,7 +166,7 @@ fn move_superseded(cmds: &[Cmd], i: usize) -> bool {
 }
 
 struct Mouse {
-    device: VirtualDevice,
+    devices: Devices,
     /// From the session agent; empty: use DRM.
     session_layout: Vec<Head>,
     layout: Layout,
@@ -142,9 +177,9 @@ struct Mouse {
 }
 
 impl Mouse {
-    fn new(device: VirtualDevice) -> Self {
+    fn new(devices: Devices) -> Self {
         let mut m = Self {
-            device,
+            devices,
             session_layout: Vec::new(),
             layout: Layout::default(),
             pressed: 0,
@@ -176,7 +211,7 @@ impl Mouse {
     }
 
     fn emit(&mut self, events: &[InputEvent]) {
-        if let Err(e) = self.device.emit(events) {
+        if let Err(e) = self.devices.pointer.emit(events) {
             tracing::warn!("uinput write failed: {e}");
         }
     }
@@ -221,7 +256,15 @@ impl Mouse {
         } else {
             self.pressed &= !bit;
         }
-        self.emit(&[*KeyEvent::new(key, down as i32)]);
+        let event = [*KeyEvent::new(key, down as i32)];
+        let res = if POINTER_BUTTONS.contains(&key) {
+            self.devices.pointer.emit(&event)
+        } else {
+            self.devices.buttons.emit(&event)
+        };
+        if let Err(e) = res {
+            tracing::warn!("uinput write failed: {e}");
+        }
     }
 
     fn release_all(&mut self) {

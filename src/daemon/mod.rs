@@ -110,6 +110,10 @@ pub struct Shared {
     host: Mutex<Option<Connection>>,
     /// The host's clipboard grab, given again to a new active agent.
     host_grab: Mutex<Option<(u32, Vec<String>)>>,
+    /// The last guest clipboard signal sent to the host was `Released`:
+    /// another one would say nothing new. Cleared when the host session or
+    /// the active agent changes, so that a real change is always sent.
+    guest_released: AtomicBool,
     effects: Mutex<Effects>,
     transfers: Mutex<HashMap<u32, Transfer>>,
     next_transfer: AtomicU32,
@@ -135,6 +139,7 @@ impl Shared {
             current: Mutex::new(None),
             host: Mutex::new(None),
             host_grab: Mutex::new(None),
+            guest_released: AtomicBool::new(false),
             effects: Mutex::new(Effects::load()),
             transfers: Mutex::new(HashMap::new()),
             next_transfer: AtomicU32::new(0),
@@ -214,6 +219,7 @@ impl Shared {
                 .map(|a| a.layout.lock().unwrap().clone())
                 .unwrap_or_default(),
         ));
+        self.guest_released.store(false, Ordering::Relaxed);
         let _ = self.clip.send(ClipCmd::Activated { old, new });
     }
 
@@ -274,6 +280,11 @@ impl Shared {
         else {
             return;
         };
+        let released = grab.is_none();
+        if self.guest_released.swap(released, Ordering::Relaxed) && released {
+            tracing::debug!("guest clipboard still empty: Released not sent again");
+            return;
+        }
         let res = match grab {
             Some((serial, mimes)) => {
                 tracing::info!(serial, ?mimes, "signal Grabbed sent to the host");
@@ -414,6 +425,7 @@ pub async fn run() -> Result<()> {
                         tracing::info!("D-Bus session {g} established");
                         s.established = true;
                         *shared.host.lock().unwrap() = Some(conn);
+                        shared.guest_released.store(false, Ordering::Relaxed);
                         // The guest clipboard, for the new host.
                         if let Some(agent) = shared.current() {
                             tokio::spawn(async move {
@@ -588,6 +600,36 @@ mod tests {
         // Bad names are refused by the agent, as InvalidArgument.
         let err = ft.start("../x", 1).await.unwrap_err();
         assert!(err.to_string().contains("InvalidArgument"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn released_is_not_repeated() {
+        use futures_util::StreamExt;
+        let (shared, _clip_rx) = Shared::new(MouseHandle::detached(), None);
+        let host = host_client(shared.clone()).await;
+        let cb = proto::ClipboardProxy::builder(&host)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .unwrap();
+        let mut released = cb.receive_released().await.unwrap();
+        let mut grabbed = cb.receive_grabbed().await.unwrap();
+        shared.emit_clipboard(None).await;
+        shared.emit_clipboard(None).await;
+        shared
+            .emit_clipboard(Some((1, vec![proto::mime::TEXT.into()])))
+            .await;
+        shared.emit_clipboard(None).await;
+        // A new active agent says it again, even if empty.
+        shared.guest_released.store(false, Ordering::Relaxed);
+        shared.emit_clipboard(None).await;
+        let wait = Duration::from_millis(200);
+        let mut count = 0;
+        while tokio::time::timeout(wait, released.next()).await.is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        assert!(tokio::time::timeout(wait, grabbed.next()).await.is_ok());
     }
 
     /// The real session agent on this desktop: `cargo build && cargo test -- --ignored`
