@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use proto::{Error, HostClipboardProxy, Result};
+use proto::{Error, HostClipboardProxy, HostFileClipboardProxy, Result};
 use tokio::net::UnixListener;
 use zbus::Connection;
 use zbus::proxy::CacheProperties;
@@ -138,6 +138,29 @@ impl DaemonIface {
     fn is_current(&self) -> bool {
         self.shared.current().is_some_and(|a| a.id == self.agent.id)
     }
+
+    /// `Host.FileClipboard1`, for the active agent only.
+    async fn host_files(&self) -> Result<HostFileClipboardProxy<'static>> {
+        if !self.is_current() {
+            return Err(Error::NoData("not the active session".into()));
+        }
+        let conn = self
+            .shared
+            .host()
+            .ok_or_else(|| Error::NoData("no host session".into()))?;
+        Ok(HostFileClipboardProxy::builder(&conn)
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?)
+    }
+}
+
+/// A call to the host, with a timeout; its errors as `Failed`.
+async fn host_call<T>(call: impl std::future::Future<Output = zbus::Result<T>>) -> Result<T> {
+    tokio::time::timeout(CALL_TIMEOUT, call)
+        .await
+        .map_err(|_| Error::Failed(format!("no answer within {CALL_TIMEOUT:?}")))?
+        .map_err(|e| Error::Failed(e.to_string()))
 }
 
 #[zbus::interface(name = "fr.ameleo.DisplayAgent.Daemon1")]
@@ -160,6 +183,38 @@ impl DaemonIface {
         if self.is_current() {
             self.shared.emit_clipboard(None).await;
         }
+    }
+
+    async fn host_lock_clip_data(&self, clip_data_id: u32) -> Result<()> {
+        let p = self.host_files().await?;
+        host_call(p.lock_clip_data(clip_data_id)).await
+    }
+
+    async fn host_unlock_clip_data(&self, clip_data_id: u32) -> Result<()> {
+        let p = self.host_files().await?;
+        host_call(p.unlock_clip_data(clip_data_id)).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn host_file_contents(
+        &self,
+        lindex: i32,
+        flags: u32,
+        position: u64,
+        requested: u32,
+        clip_data_id: u32,
+        has_clip_data_id: bool,
+    ) -> Result<Vec<u8>> {
+        let p = self.host_files().await?;
+        host_call(p.file_contents(
+            lindex,
+            flags,
+            position,
+            requested,
+            clip_data_id,
+            has_clip_data_id,
+        ))
+        .await
     }
 
     async fn host_clipboard_request(

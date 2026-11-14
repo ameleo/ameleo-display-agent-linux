@@ -7,11 +7,14 @@
 
 mod clipboard;
 mod effects;
+pub(crate) mod filelist;
 mod filexfer;
 mod gnome;
+mod hostfiles;
 mod wayland;
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -53,9 +56,36 @@ struct State {
     guest: Mutex<Option<Vec<String>>>,
     serial: AtomicU32,
     xfer: Mutex<filexfer::FileXfer>,
+    /// Files copied in the guest, for the host.
+    files: Mutex<filelist::GuestFiles>,
+    open_file: filelist::OpenFile,
+    /// Host files pasted in the guest; unset when FUSE is not available.
+    host_files: OnceLock<hostfiles::HostFiles>,
+    /// The host grab whose files are in `host_files`, and their paths.
+    /// Held while the list is fetched: a paste in several types fetches it
+    /// once.
+    pasted: tokio::sync::Mutex<Option<(u32, Vec<PathBuf>)>>,
+    /// The next `LockClipData` id for the host's lists.
+    next_lock: AtomicU32,
 }
 
 impl State {
+    fn new(clip: Clip, guest: Option<Vec<String>>) -> Self {
+        Self {
+            daemon: OnceLock::new(),
+            clip,
+            host: Mutex::new(None),
+            guest: Mutex::new(guest),
+            serial: AtomicU32::new(0),
+            xfer: Mutex::new(filexfer::FileXfer::default()),
+            files: Mutex::new(filelist::GuestFiles::default()),
+            open_file: Mutex::new(None),
+            host_files: OnceLock::new(),
+            pasted: tokio::sync::Mutex::new(None),
+            next_lock: AtomicU32::new(0),
+        }
+    }
+
     fn daemon(&self) -> &DaemonProxy<'static> {
         self.daemon.get().expect("daemon proxy set at connection")
     }
@@ -72,6 +102,10 @@ impl State {
         } else {
             let serial = self.serial.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             tracing::info!(serial, ?exported, "guest clipboard grabbed");
+            // A new guest copy: the previous file list is not current
+            // anymore, and its last file need not stay open.
+            self.files.lock().unwrap().clipboard_changed(serial);
+            *self.open_file.lock().unwrap() = None;
             self.daemon().clipboard_grabbed(serial, exported).await
         };
         if let Err(e) = res {
@@ -91,6 +125,10 @@ impl State {
         if types.is_empty() {
             return Err(format!("the host has nothing for {guest_mime}"));
         }
+        if clipboard::is_file_list(guest_mime) {
+            let paths = self.host_file_paths(serial).await?;
+            return Ok(clipboard::file_list(guest_mime, &paths));
+        }
         let (mime, data) = self
             .daemon()
             .host_clipboard_request(serial, types)
@@ -99,9 +137,90 @@ impl State {
         clipboard::convert(&mime, guest_mime, data)
     }
 
+    /// The host files of grab `serial`, in the FUSE file system: locks the
+    /// host's content, fetches its list, mounts it.
+    async fn host_file_paths(&self, serial: u32) -> Result<Vec<PathBuf>, String> {
+        let mut pasted = self.pasted.lock().await;
+        if let Some((s, paths)) = &*pasted
+            && *s == serial
+        {
+            return Ok(paths.clone());
+        }
+        let files = self
+            .host_files
+            .get()
+            .ok_or("host files cannot be pasted: no FUSE")?;
+        // The lock first: it freezes the content the list is about.
+        let lock = self
+            .next_lock
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let daemon = self.daemon();
+        daemon
+            .host_lock_clip_data(lock)
+            .await
+            .map_err(|e| e.to_string())?;
+        let res = async {
+            let (_, data) = daemon
+                .host_clipboard_request(serial, vec![proto::mime::FILE_LIST.into()])
+                .await
+                .map_err(|e| e.to_string())?;
+            filelist::decode(&data)
+        }
+        .await;
+        let entries = match res {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = daemon.host_unlock_clip_data(lock).await;
+                return Err(e);
+            }
+        };
+        let paths = files.add(lock, &entries);
+        tracing::info!(
+            serial,
+            lock,
+            files = entries.len(),
+            "host files ready to paste"
+        );
+        *pasted = Some((serial, paths.clone()));
+        Ok(paths)
+    }
+
+    /// The CLIPRDR_FILELIST of the files copied in the guest, built once
+    /// per guest copy (big trees take a while).
+    async fn guest_file_list(&self, source: &str) -> Result<Vec<u8>, Error> {
+        let serial = self.serial.load(Ordering::Relaxed);
+        let cached = self.files.lock().unwrap().cached(serial);
+        let entries = match cached {
+            Some(e) => e,
+            None => {
+                let uris = self.clip.read(source).await.map_err(Error::NoData)?;
+                let paths = filelist::parse_uri_list(&uris);
+                if paths.is_empty() {
+                    return Err(Error::NoData("no local files on the clipboard".into()));
+                }
+                let entries = tokio::task::spawn_blocking(move || filelist::walk(&paths))
+                    .await
+                    .map_err(|e| Error::Failed(e.to_string()))??;
+                tracing::info!(serial, files = entries.len(), "guest file list built");
+                let entries = Arc::new(entries);
+                self.files
+                    .lock()
+                    .unwrap()
+                    .set_current(serial, entries.clone());
+                entries
+            }
+        };
+        Ok(filelist::encode(&entries))
+    }
+
     /// GNOME: the host copied, put its data on the clipboard now.
     async fn set_gnome(&self, gnome: &gnome::Handle, serial: u32, host: &[String]) {
-        let mime = if host.iter().any(|m| clipboard::is_text(m)) {
+        let files =
+            self.host_files.get().is_some() && host.iter().any(|m| m == proto::mime::FILE_LIST);
+        let mime = if files {
+            clipboard::GUEST_FILES[1]
+        } else if host.iter().any(|m| clipboard::is_text(m)) {
             clipboard::GUEST_TEXT[0]
         } else {
             "image/png"
@@ -128,7 +247,7 @@ impl SessionIface {
         *self.0.host.lock().unwrap() = Some((serial, mimes.clone()));
         match &self.0.clip {
             Clip::Wayland(w) => {
-                let offer = clipboard::offer_for(&mimes);
+                let offer = clipboard::offer_for(&mimes, self.0.host_files.get().is_some());
                 w.offer((!offer.is_empty()).then_some(offer));
             }
             Clip::Gnome(g) => {
@@ -162,6 +281,10 @@ impl SessionIface {
             let Some(source) = clipboard::guest_source(wanted, &guest) else {
                 continue;
             };
+            if wanted == proto::mime::FILE_LIST {
+                let data = self.0.guest_file_list(&source).await?;
+                return Ok((wanted.clone(), data));
+            }
             let data = self.0.clip.read(&source).await.map_err(Error::NoData)?;
             let data = tokio::task::spawn_blocking({
                 let (source, wanted) = (source.clone(), wanted.clone());
@@ -178,6 +301,44 @@ impl SessionIface {
 
     async fn announce(&self) {
         self.0.announce().await;
+    }
+
+    fn lock_clip_data(&self, clip_data_id: u32) -> proto::Result<()> {
+        self.0.files.lock().unwrap().lock(clip_data_id)
+    }
+
+    fn unlock_clip_data(&self, clip_data_id: u32) {
+        self.0.files.lock().unwrap().unlock(clip_data_id);
+    }
+
+    async fn file_contents(
+        &self,
+        lindex: i32,
+        flags: u32,
+        position: u64,
+        requested: u32,
+        clip_data_id: u32,
+        has_clip_data_id: bool,
+    ) -> proto::Result<Vec<u8>> {
+        let entries = self
+            .0
+            .files
+            .lock()
+            .unwrap()
+            .entries(has_clip_data_id.then_some(clip_data_id))?;
+        let state = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            filelist::contents(
+                &entries,
+                &state.open_file,
+                lindex,
+                flags,
+                position,
+                requested,
+            )
+        })
+        .await
+        .map_err(|e| Error::Failed(e.to_string()))?
     }
 
     fn set_effects(&self, no_wallpaper: bool, no_font_smoothing: bool, no_animation: bool) {
@@ -210,6 +371,12 @@ impl SessionIface {
     async fn reset(&self) {
         tracing::info!("host session reset");
         self.0.xfer.lock().unwrap().reset();
+        self.0.files.lock().unwrap().reset();
+        *self.0.open_file.lock().unwrap() = None;
+        *self.0.pasted.lock().await = None;
+        if let Some(files) = self.0.host_files.get() {
+            files.clear();
+        }
         self.clipboard_release().await;
     }
 }
@@ -226,7 +393,7 @@ trait FileManager {
 
 /// Shows the received file in the file manager, selected.
 async fn show_file(path: std::path::PathBuf) {
-    let uri = file_uri(&path);
+    let uri = filelist::file_uri(&path);
     let res = async {
         let conn = zbus::Connection::session().await?;
         FileManagerProxy::new(&conn)
@@ -238,19 +405,6 @@ async fn show_file(path: std::path::PathBuf) {
     if let Err(e) = res {
         tracing::warn!("cannot show {} in the file manager: {e}", path.display());
     }
-}
-
-fn file_uri(path: &std::path::Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    let mut uri = String::from("file://");
-    for &b in path.as_os_str().as_bytes() {
-        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
-            uri.push(b as char);
-        } else {
-            uri.push_str(&format!("%{b:02X}"));
-        }
-    }
-    uri
 }
 
 /// Writes host data to a guest app pasting it.
@@ -285,6 +439,45 @@ async fn connect_daemon() -> tokio::net::UnixStream {
     }
 }
 
+/// Mounts the file system for host files; without it, host files cannot
+/// be pasted, the rest works.
+fn mount_host_files(state: &State, daemon: DaemonProxy<'static>) {
+    let Some(runtime) = dirs::runtime_dir() else {
+        tracing::warn!("no XDG_RUNTIME_DIR: host files cannot be pasted");
+        return;
+    };
+    let fetch_daemon = daemon.clone();
+    let fetch: hostfiles::Fetch = Arc::new(move |clip_data_id, lindex, position, len| {
+        let daemon = fetch_daemon.clone();
+        Box::pin(async move {
+            daemon
+                .host_file_contents(
+                    lindex,
+                    proto::file_contents::RANGE,
+                    position,
+                    len,
+                    clip_data_id,
+                    true,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        })
+    });
+    let unlock: hostfiles::Unlock = Arc::new(move |clip_data_id| {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            let _ = daemon.host_unlock_clip_data(clip_data_id).await;
+        });
+    });
+    let mount = runtime.join("ameleo-display-agent").join("clipboard");
+    match hostfiles::HostFiles::mount(mount, fetch, unlock) {
+        Ok(files) => {
+            let _ = state.host_files.set(files);
+        }
+        Err(e) => tracing::warn!("cannot mount the host files ({e}): they cannot be pasted"),
+    }
+}
+
 fn is_gnome() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .unwrap_or_default()
@@ -309,14 +502,7 @@ pub async fn run() -> Result<()> {
         tracing::warn!("no clipboard: the compositor has no data control protocol");
         Clip::None
     };
-    let state = Arc::new(State {
-        daemon: OnceLock::new(),
-        clip,
-        host: Mutex::new(None),
-        guest: Mutex::new(None),
-        serial: AtomicU32::new(0),
-        xfer: Mutex::new(filexfer::FileXfer::default()),
-    });
+    let state = Arc::new(State::new(clip, None));
 
     let stream = connect_daemon().await;
     let conn = zbus::connection::Builder::unix_stream(stream)
@@ -328,8 +514,9 @@ pub async fn run() -> Result<()> {
         .cache_properties(CacheProperties::No)
         .build()
         .await?;
-    let _ = state.daemon.set(daemon);
+    let _ = state.daemon.set(daemon.clone());
     tracing::info!("connected to the daemon");
+    mount_host_files(&state, daemon);
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
@@ -367,14 +554,7 @@ pub async fn test_agent(
     stream: tokio::net::UnixStream,
     guest: Option<Vec<String>>,
 ) -> zbus::Connection {
-    let state = Arc::new(State {
-        daemon: OnceLock::new(),
-        clip: Clip::None,
-        host: Mutex::new(None),
-        guest: Mutex::new(guest),
-        serial: AtomicU32::new(0),
-        xfer: Mutex::new(filexfer::FileXfer::default()),
-    });
+    let state = Arc::new(State::new(Clip::None, guest));
     let conn = zbus::connection::Builder::unix_stream(stream)
         .p2p()
         .serve_at(SESSION_PATH, SessionIface(state.clone()))
@@ -396,7 +576,7 @@ mod tests {
     #[test]
     fn uris() {
         assert_eq!(
-            super::file_uri(std::path::Path::new("/home/a/Téléchargements/x y.pdf")),
+            super::filelist::file_uri(std::path::Path::new("/home/a/Téléchargements/x y.pdf")),
             "file:///home/a/T%C3%A9l%C3%A9chargements/x%20y.pdf"
         );
     }

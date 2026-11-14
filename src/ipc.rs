@@ -62,6 +62,20 @@ pub trait Session {
     fn file_finish(&self, id: u32) -> zbus::Result<String>;
     fn file_cancel(&self, id: u32) -> zbus::Result<()>;
 
+    /// `FileClipboard1`, for the files copied in the guest.
+    fn lock_clip_data(&self, clip_data_id: u32) -> zbus::Result<()>;
+    fn unlock_clip_data(&self, clip_data_id: u32) -> zbus::Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn file_contents(
+        &self,
+        lindex: i32,
+        flags: u32,
+        position: u64,
+        requested: u32,
+        clip_data_id: u32,
+        has_clip_data_id: bool,
+    ) -> zbus::Result<Vec<u8>>;
+
     /// The host session ended or the client went away: drop the host
     /// clipboard and abort the transfers.
     fn reset(&self) -> zbus::Result<()>;
@@ -80,6 +94,19 @@ pub trait Daemon {
     fn clipboard_grabbed(&self, serial: u32, mimes: Vec<String>) -> zbus::Result<()>;
     /// The guest clipboard holds nothing exportable anymore.
     fn clipboard_released(&self) -> zbus::Result<()>;
+    /// `Host.FileClipboard1`, for the host files pasted in the guest.
+    fn host_lock_clip_data(&self, clip_data_id: u32) -> zbus::Result<()>;
+    fn host_unlock_clip_data(&self, clip_data_id: u32) -> zbus::Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn host_file_contents(
+        &self,
+        lindex: i32,
+        flags: u32,
+        position: u64,
+        requested: u32,
+        clip_data_id: u32,
+        has_clip_data_id: bool,
+    ) -> zbus::Result<Vec<u8>>;
     /// A guest app pastes host data: `Host.Clipboard1.Request`.
     fn host_clipboard_request(
         &self,

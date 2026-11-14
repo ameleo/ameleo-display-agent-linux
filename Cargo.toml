@@ -27,4 +27,5 @@ wayland-protocols = { version = "0.32", features = ["client", "staging", "unstab
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
 dirs = "6"
+fuser = { version = "0.18", default-features = false }
 futures-util = { version = "0.3", default-features = false }

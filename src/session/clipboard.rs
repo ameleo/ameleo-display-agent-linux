@@ -22,6 +22,26 @@ pub const GUEST_TEXT: &[&str] = &[
 /// Image types we can read from a guest app, best first.
 const GUEST_IMAGES: &[&str] = &["image/png", "image/bmp", "image/x-bmp", "image/jpeg"];
 
+/// File lists of the file managers: Dolphin and most apps, then Nautilus.
+pub const GUEST_FILES: &[&str] = &["text/uri-list", "x-special/gnome-copied-files"];
+
+pub fn is_file_list(m: &str) -> bool {
+    GUEST_FILES.contains(&m)
+}
+
+/// The file list of `paths` as the guest type `mime`.
+pub fn file_list(mime: &str, paths: &[std::path::PathBuf]) -> Vec<u8> {
+    let uris: Vec<String> = paths.iter().map(|p| super::filelist::file_uri(p)).collect();
+    if mime == "x-special/gnome-copied-files" {
+        format!("copy\n{}", uris.join("\n")).into_bytes()
+    } else {
+        uris.iter()
+            .map(|u| format!("{u}\r\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+}
+
 pub fn is_text(m: &str) -> bool {
     m.eq_ignore_ascii_case(mime::TEXT) || GUEST_TEXT.iter().any(|t| t.eq_ignore_ascii_case(m))
 }
@@ -34,6 +54,9 @@ fn is_image(m: &str) -> bool {
 /// guest app offers.
 pub fn exportable(guest: &[String]) -> Vec<String> {
     let mut out = Vec::new();
+    if guest.iter().any(|m| is_file_list(m)) {
+        out.push(mime::FILE_LIST.to_string());
+    }
     if guest.iter().any(|m| is_text(m)) {
         out.push(mime::TEXT.to_string());
     }
@@ -54,6 +77,9 @@ pub fn guest_source(wanted: &str, guest: &[String]) -> Option<String> {
     if wanted.eq_ignore_ascii_case(mime::TEXT) {
         return pick(GUEST_TEXT);
     }
+    if wanted == mime::FILE_LIST {
+        return pick(GUEST_FILES);
+    }
     if wanted == mime::PNG || wanted == mime::BMP {
         // The type asked for as it is, else any image we can convert.
         if guest.iter().any(|g| g == wanted) {
@@ -64,9 +90,13 @@ pub fn guest_source(wanted: &str, guest: &[String]) -> Option<String> {
     None
 }
 
-/// The guest types to offer for a host grab of `host` types.
-pub fn offer_for(host: &[String]) -> Vec<String> {
+/// The guest types to offer for a host grab of `host` types; `files`: host
+/// files can be pasted.
+pub fn offer_for(host: &[String], files: bool) -> Vec<String> {
     let mut out = Vec::new();
+    if files && host.iter().any(|m| m == mime::FILE_LIST) {
+        out.extend(GUEST_FILES.iter().map(|s| s.to_string()));
+    }
     if host.iter().any(|m| is_text(m)) {
         out.extend(GUEST_TEXT.iter().map(|s| s.to_string()));
     }
@@ -81,6 +111,13 @@ pub fn offer_for(host: &[String]) -> Vec<String> {
 pub fn host_types_for(guest: &str, host: &[String]) -> Vec<String> {
     if is_text(guest) {
         return host.iter().filter(|m| is_text(m)).cloned().collect();
+    }
+    if is_file_list(guest) {
+        return host
+            .iter()
+            .filter(|m| *m == mime::FILE_LIST)
+            .cloned()
+            .collect();
     }
     let order: &[&str] = match guest {
         "image/png" => &[mime::PNG, mime::BMP],
@@ -129,7 +166,23 @@ mod tests {
     fn export_types() {
         assert_eq!(exportable(&v(&["UTF8_STRING", "TEXT"])), v(&[mime::TEXT]));
         assert_eq!(exportable(&v(&["image/jpeg"])), v(&[mime::PNG, mime::BMP]));
-        assert!(exportable(&v(&["text/uri-list", "x-special/gnome-copied-files"])).is_empty());
+        assert_eq!(
+            exportable(&v(&["text/uri-list", "text/plain"])),
+            v(&[mime::FILE_LIST, mime::TEXT])
+        );
+        assert_eq!(
+            guest_source(mime::FILE_LIST, &v(&["x-special/gnome-copied-files"])).as_deref(),
+            Some("x-special/gnome-copied-files")
+        );
+        let paths = [std::path::PathBuf::from("/a b"), "/c".into()];
+        assert_eq!(
+            file_list("text/uri-list", &paths),
+            b"file:///a%20b\r\nfile:///c\r\n"
+        );
+        assert_eq!(
+            file_list("x-special/gnome-copied-files", &paths),
+            b"copy\nfile:///a%20b\nfile:///c"
+        );
     }
 
     #[test]
@@ -148,7 +201,11 @@ mod tests {
         assert_eq!(host_types_for("image/png", &h), v(&[mime::BMP]));
         let h = v(&[mime::TEXT, "text/plain"]);
         assert_eq!(host_types_for("STRING", &h), h);
-        assert!(offer_for(&v(&[mime::PNG])).contains(&"image/png".to_string()));
+        assert!(offer_for(&v(&[mime::PNG]), true).contains(&"image/png".to_string()));
+        let h = v(&[mime::FILE_LIST, mime::TEXT]);
+        assert_eq!(offer_for(&h, true)[..2], GUEST_FILES[..]);
+        assert!(!offer_for(&h, false).iter().any(|m| is_file_list(m)));
+        assert_eq!(host_types_for("text/uri-list", &h), v(&[mime::FILE_LIST]));
     }
 
     #[test]

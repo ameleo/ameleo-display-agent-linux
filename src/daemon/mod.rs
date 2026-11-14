@@ -22,7 +22,9 @@ use zbus::{AuthMechanism, Connection};
 use crate::channel::port::{Port, PortEvent};
 use crate::channel::transport;
 use agents::Agent;
-use host::{AgentIface, ClipboardIface, DisplayIface, FileTransferIface, MouseIface};
+use host::{
+    AgentIface, ClipboardIface, DisplayIface, FileClipboardIface, FileTransferIface, MouseIface,
+};
 use mouse::MouseHandle;
 
 /// Longest wait for one call to the host or to a session agent.
@@ -469,6 +471,7 @@ async fn build(split: transport::Split, shared: Arc<Shared>) -> zbus::Result<Con
         .serve_at(AGENT_PATH, AgentIface(shared.clone()))?
         .serve_at(AGENT_PATH, MouseIface(shared.clone()))?
         .serve_at(AGENT_PATH, ClipboardIface(shared.clone()))?
+        .serve_at(AGENT_PATH, FileClipboardIface(shared.clone()))?
         .serve_at(AGENT_PATH, DisplayIface(shared.clone()))?
         .serve_at(AGENT_PATH, FileTransferIface(shared))?
         .build()
@@ -488,7 +491,41 @@ mod tests {
     #[zbus::interface(name = "fr.ameleo.Host.Clipboard1")]
     impl FakeHost {
         fn request(&self, _serial: u32, mimes: Vec<String>) -> (String, Vec<u8>) {
+            if mimes[0] == proto::mime::FILE_LIST {
+                // One file, `hello.txt`, whose content is the text.
+                let entry = crate::session::filelist::Entry {
+                    name: "hello.txt".into(),
+                    attributes: 0x20,
+                    size: self.0.len() as u64,
+                    write_time: 0,
+                    path: Default::default(),
+                };
+                return (mimes[0].clone(), crate::session::filelist::encode(&[entry]));
+            }
             (mimes[0].clone(), self.0.as_bytes().to_vec())
+        }
+    }
+
+    /// The host's files: the text of [`FakeHost`], as file 0.
+    struct FakeHostFiles(String);
+
+    #[zbus::interface(name = "fr.ameleo.Host.FileClipboard1")]
+    impl FakeHostFiles {
+        fn lock_clip_data(&self, _id: u32) {}
+        fn unlock_clip_data(&self, _id: u32) {}
+        fn file_contents(
+            &self,
+            _lindex: i32,
+            _flags: u32,
+            position: u64,
+            requested: u32,
+            _clip_data_id: u32,
+            _has_clip_data_id: bool,
+        ) -> Vec<u8> {
+            let data = self.0.as_bytes();
+            let start = (position as usize).min(data.len());
+            let end = (start + requested as usize).min(data.len());
+            data[start..end].to_vec()
         }
     }
 
@@ -517,6 +554,11 @@ mod tests {
             .p2p()
             .auth_mechanism(AuthMechanism::Anonymous)
             .serve_at(proto::HOST_PATH, FakeHost("hello from the host".into()))
+            .unwrap()
+            .serve_at(
+                proto::HOST_PATH,
+                FakeHostFiles("hello from the host".into()),
+            )
             .unwrap()
             .build()
             .await
@@ -649,12 +691,20 @@ mod tests {
         shared.locked.store(false, Ordering::Relaxed);
         let sock = std::env::temp_dir().join(format!("ada-live-{}.sock", std::process::id()));
         agents::listen(shared.clone(), &sock).unwrap();
+        let runtime = std::env::temp_dir().join(format!("ada-live-run-{}", std::process::id()));
+        std::fs::create_dir_all(&runtime).unwrap();
+        let wayland = std::path::Path::new(&std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+            .join(std::env::var_os("WAYLAND_DISPLAY").unwrap());
         let mut child = tokio::process::Command::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/target/debug/ameleo-display-agent"
         ))
         .arg("session")
         .env("AMELEO_DISPLAY_AGENT_SOCKET", &sock)
+        // Its own runtime directory, for its FUSE mount; the compositor
+        // by its full path.
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("WAYLAND_DISPLAY", &wayland)
         .env("AMELEO_DISPLAY_AGENT_LOG", "debug")
         .kill_on_drop(true)
         .spawn()
@@ -708,8 +758,75 @@ mod tests {
         assert_eq!(mime, proto::mime::TEXT);
         assert_eq!(String::from_utf8_lossy(&data), "hello from the guest");
 
+        // Host files pasted in the guest, through FUSE.
+        cb.grab(8, vec![proto::mime::FILE_LIST.into()])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let out = tokio::process::Command::new("wl-paste")
+            .args(["-n", "-t", "text/uri-list"])
+            .output()
+            .await
+            .unwrap();
+        let paths = crate::session::filelist::parse_uri_list(&out.stdout);
+        eprintln!("pasted: {paths:?}");
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].starts_with(&runtime));
+        let content = tokio::fs::read_to_string(&paths[0]).await.unwrap();
+        assert_eq!(content, "hello from the host");
+
+        // Guest files copied for the host.
+        let dir = std::env::temp_dir().join(format!("ada-live-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("g.txt"), b"guest file").unwrap();
+        let uri = crate::session::filelist::file_uri(&dir.join("g.txt"));
+        let status = tokio::process::Command::new("wl-copy")
+            .args(["-t", "text/uri-list", &uri])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        let sig = tokio::time::timeout(Duration::from_secs(3), grabbed.next())
+            .await
+            .expect("Grabbed signal")
+            .unwrap();
+        assert!(
+            sig.args()
+                .unwrap()
+                .mimes
+                .contains(&proto::mime::FILE_LIST.to_string())
+        );
+        let (_, list) = cb
+            .request(vec![proto::mime::FILE_LIST.into()])
+            .await
+            .unwrap();
+        let entries = crate::session::filelist::decode(&list).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "g.txt");
+        let fc = proto::FileClipboardProxy::builder(&host)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .unwrap();
+        fc.lock_clip_data(1).await.unwrap();
+        let data = fc
+            .file_contents(0, proto::file_contents::RANGE, 6, 100, 1, true)
+            .await
+            .unwrap();
+        assert_eq!(data, b"file");
+        fc.unlock_clip_data(1).await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
         let _ = child.kill().await;
+        let _ = child.wait().await;
         let _ = std::fs::remove_file(&sock);
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-u", "-z"])
+            .arg(runtime.join("ameleo-display-agent/clipboard"))
+            .status();
+        let _ = std::fs::remove_dir_all(&runtime);
         let _ = std::process::Command::new("wl-copy")
             .arg("--clear")
             .status();

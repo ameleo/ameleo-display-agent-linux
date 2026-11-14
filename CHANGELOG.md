@@ -16,10 +16,12 @@ Wayland session (GNOME, Plasma or wlroots) handles the user's desktop.
   buttons, both wheels and high resolution scrolling.
 - **Clipboard:** text and images (PNG and BMP), in both directions. On GNOME, the clipboard goes
   through the agent's GNOME Shell extension.
+- **File clipboard:** files and folders in both directions, in the MS-RDPECLIP format. Host
+  files are read on demand through a FUSE file system, so nothing is copied in advance.
 - **File transfer:** files sent from the client are saved in Downloads.
 - **Display effects:** wallpaper, font smoothing and animations can be turned off on request, on
   GNOME and Plasma, and are restored afterwards.
 
 `make deploy` installs the agent with its systemd services and a udev rule that starts the
-daemon when the agent port appears. There are no distribution packages yet. The file clipboard,
-client cameras, client printers and client drives are not supported yet.
+daemon when the agent port appears. There are no distribution packages yet. Client cameras,
+client printers and client drives are not supported yet.

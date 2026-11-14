@@ -48,6 +48,7 @@ impl AgentIface {
         [
             iface::MOUSE,
             iface::CLIPBOARD,
+            iface::FILE_CLIPBOARD,
             iface::DISPLAY,
             iface::FILE_TRANSFER,
         ]
@@ -151,6 +152,73 @@ impl ClipboardIface {
 
     #[zbus(signal)]
     pub async fn released(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+pub struct FileClipboardIface(pub Arc<Shared>);
+
+/// Files copied in the guest: served by the active session agent.
+#[zbus::interface(name = "fr.ameleo.Agent.FileClipboard1")]
+impl FileClipboardIface {
+    async fn lock_clip_data(&self, clip_data_id: u32) -> Result<()> {
+        tracing::debug!(clip_data_id, "lock clip data");
+        let agent = self.0.current().ok_or_else(no_agent)?;
+        on_agent(
+            &agent,
+            |p| async move { p.lock_clip_data(clip_data_id).await },
+        )
+        .await
+    }
+
+    async fn unlock_clip_data(&self, clip_data_id: u32) -> Result<()> {
+        tracing::debug!(clip_data_id, "unlock clip data");
+        let agent = self.0.current().ok_or_else(no_agent)?;
+        on_agent(
+            &agent,
+            |p| async move { p.unlock_clip_data(clip_data_id).await },
+        )
+        .await
+    }
+
+    async fn file_contents(
+        &self,
+        lindex: i32,
+        flags: u32,
+        position: u64,
+        requested: u32,
+        clip_data_id: u32,
+        has_clip_data_id: bool,
+    ) -> Result<Vec<u8>> {
+        if self.0.locked.load(Ordering::Relaxed) {
+            return Err(Error::SessionLocked("the session is locked".into()));
+        }
+        let agent = self.0.current().ok_or_else(no_agent)?;
+        let t = std::time::Instant::now();
+        let res = on_agent(&agent, |p| async move {
+            p.file_contents(
+                lindex,
+                flags,
+                position,
+                requested,
+                clip_data_id,
+                has_clip_data_id,
+            )
+            .await
+        })
+        .await;
+        match &res {
+            Ok(d) => {
+                tracing::debug!(lindex, flags, position, requested, bytes = d.len(), took = ?t.elapsed(), "guest file contents served")
+            }
+            Err(e) => tracing::warn!(
+                lindex,
+                flags,
+                position,
+                requested,
+                "guest file contents failed: {e}"
+            ),
+        }
+        res
+    }
 }
 
 pub struct DisplayIface(pub Arc<Shared>);

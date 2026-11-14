@@ -37,7 +37,7 @@ The modules of `src`, by feature:
 | `main`, `ipc` | The entry point, and the private D-Bus interfaces between the daemon and the session agents |
 | `channel/` | The virtio-serial port and the D-Bus sessions on it |
 | `daemon/` | The host's interfaces, the uinput pointer, logind and the session agents |
-| `session/` | The clipboard (Wayland or GNOME Shell), the monitors, file transfer and desktop effects |
+| `session/` | The clipboard (Wayland or GNOME Shell), the file clipboard, the monitors, file transfer and desktop effects |
 
 `gnome-shell-extension/` holds the GNOME Shell extension that gives the clipboard to the agent
 on GNOME, and `packaging/` the systemd units and the udev rule.
@@ -163,6 +163,28 @@ the D-Bus framing to see a new handshake, whatever the port reports.
   between PNG and BMP when one side has only one of them, and exports JPEG copies as PNG.
 * **Lock.** The agent does not give out the guest clipboard while the session is locked.
 
+### File clipboard
+
+Files and folders go through the clipboard in both directions, in the MS-RDPECLIP format, so a
+host that bridges an RDP client passes them on as they are.
+
+* **Guest to host.** When the user copies files in a file manager (`text/uri-list` or
+  `x-special/gnome-copied-files`), the agent offers a file list to the host. It walks the copied
+  files and folders as the user, and reads each file only when the host asks for it
+  (`FileContents`). It follows a link to a file, but not a link to a folder below the copied
+  items, and leaves out pipes and devices.
+* **Host to guest.** Linux file managers paste paths, not file contents. So that nothing is
+  copied into the guest in advance, the agent mounts a read-only FUSE file system on
+  `$XDG_RUNTIME_DIR/ameleo-display-agent/clipboard`, which only the user can see. When the user
+  pastes, the agent locks the host's clipboard content (`LockClipData`), puts the host's list in
+  a folder of that file system, and gives the paths to the file manager. The file manager's
+  reads go to the host as `FileContents` requests while it copies, with its own progress dialog.
+  The last four host lists stay readable, so that a long copy survives a few new host copies.
+* **Names.** The agent checks the names that come from the host: no `..`, no root and no `/`.
+* **Lock.** The host cannot read the guest files while the session is locked.
+
+Without FUSE (`/dev/fuse` and `fusermount3`), host files cannot be pasted; the rest works.
+
 ### File transfer
 
 * Files are saved in the user's Downloads folder (`XDG_DOWNLOAD_DIR`), as the user. When the
@@ -192,6 +214,7 @@ setting.
 |---|---|
 | Absolute mouse through uinput, multiple monitors | Same, with the layout of the Wayland compositors, HiDPI and fractional scaling, plus the horizontal wheel and high resolution scrolling |
 | Clipboard text and images, on X11 and partly on Wayland | Text, PNG and BMP on Wayland: GNOME, Plasma and wlroots |
+| Clipboard file lists through spice-webdavd | Replaced by the MS-RDPECLIP file clipboard, both ways, without webdavd: host files are read on demand through FUSE |
 | File transfer to Downloads, `name (n).ext` | Same, with flow control through method replies; refused while the session is locked |
 | Reset when the client disconnects | `Agent1.Reset()`, which also locks the session, done implicitly on every new session |
 | Monitor configuration | **Left out on purpose**: the layout belongs to the display driver and the compositor |
@@ -199,8 +222,8 @@ setting.
 
 ## Not supported yet
 
-* The file clipboard (`FileClipboard1`), client cameras, client printers and client drives. The
-  agent does not list them in `Agent1.Channels`.
+* Client cameras, client printers and client drives. The agent does not list them in
+  `Agent1.Channels`.
 * X11 sessions, and the clipboard on the login screen.
 * Distribution packages (RPM and deb).
 
