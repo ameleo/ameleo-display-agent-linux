@@ -106,6 +106,7 @@ sudo AMELEO_DISPLAY_AGENT_LOG=debug ameleo-display-agent daemon
 | Variable | Default | Effect |
 |---|---|---|
 | `AMELEO_DISPLAY_AGENT_LOG` | `info` | The `tracing` filter, such as `debug` or `debug,ameleo_display_agent::daemon::host=trace` (to see pointer events) |
+| `AMELEO_DISPLAY_AGENT_CAMERA_DUMP` | unset | A directory where the session agent saves each client camera's H.264 stream as it comes (`camera-<id>.h264`), to look into a camera problem |
 | `AMELEO_DISPLAY_AGENT_SOCKET` | `/run/ameleo-display-agent/session.sock` | The socket between the daemon and the session agents, for development |
 
 To set them for the services, use `systemctl edit` and add `Environment=` lines under
@@ -202,7 +203,9 @@ PipeWire or the camera portal list it, such as Firefox, Chromium, OBS and GNOME 
   stop is told to the host only after half a second.
 * **Decoding.** The agent decodes the H.264 stream in the guest with the system's Cisco OpenH264
   library, loaded at run time, so that no codec is built into the agent. Each picture drives the
-  node at the client's frame rate. When the decoder lost track (a stream that does not start on
+  node at the client's frame rate: the node moves the graph's clock on and stamps the picture
+  with its time, because apps such as GNOME Snapshot show pictures by that clock. While an app
+  has not taken the last picture, a newer one replaces it instead of piling up. When the decoder lost track (a stream that does not start on
   an IDR, or a frame dropped because the decoder is behind), the agent sends `KeyFrameNeeded`,
   at most once a second.
 * **Sessions.** The cameras are in the session of the user in front of the screen. When another

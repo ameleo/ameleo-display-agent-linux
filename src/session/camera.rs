@@ -190,9 +190,55 @@ pub(crate) fn load_openh264() -> Result<OpenH264API, String> {
     Err(last)
 }
 
+/// Statistics line per streaming camera.
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
 struct DecoderState {
     decoder: Option<Decoder>,
     last_key_request: Option<Instant>,
+    stats: Stats,
+    /// `AMELEO_DISPLAY_AGENT_CAMERA_DUMP`: the H.264 stream as received.
+    dump: Option<std::fs::File>,
+}
+
+/// Counters over the last [`STATS_INTERVAL`], logged while frames come.
+#[derive(Default)]
+struct Stats {
+    since: Option<Instant>,
+    received: u64,
+    bytes: u64,
+    pictures: u64,
+    errors: u64,
+    key_requests: u64,
+    first_error: Option<String>,
+    size: Option<(usize, usize)>,
+}
+
+impl Stats {
+    fn flush(&mut self, id: u32) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() < STATS_INTERVAL {
+            return;
+        }
+        if self.received > 0 {
+            tracing::info!(
+                id,
+                received = self.received,
+                kbytes = self.bytes / 1024,
+                pictures = self.pictures,
+                errors = self.errors,
+                key_requests = self.key_requests,
+                size = ?self.size,
+                first_error = self.first_error.as_deref().unwrap_or(""),
+                "camera stats (5 s)"
+            );
+        }
+        *self = Stats {
+            since: Some(Instant::now()),
+            ..Default::default()
+        };
+    }
 }
 
 fn decode_thread(
@@ -203,17 +249,29 @@ fn decode_thread(
 ) {
     let mut cams: HashMap<u32, DecoderState> = HashMap::new();
     let mut seen_drops = 0;
+    let dump_dir =
+        std::env::var_os("AMELEO_DISPLAY_AGENT_CAMERA_DUMP").map(std::path::PathBuf::from);
     let key_frame = |id: u32, st: &mut DecoderState| {
         if st
             .last_key_request
             .is_none_or(|t| t.elapsed() >= KEY_REQUEST_INTERVAL)
         {
             st.last_key_request = Some(Instant::now());
+            st.stats.key_requests += 1;
             tracing::debug!(id, "key frame needed");
             let _ = events.send(Event::KeyFrame { id });
         }
     };
-    for msg in rx {
+    loop {
+        let msg = match rx.recv_timeout(STATS_INTERVAL) {
+            Ok(m) => Some(m),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        for (&id, st) in cams.iter_mut() {
+            st.stats.flush(id);
+        }
+        let Some(msg) = msg else { continue };
         let drops = dropped.load(Ordering::Acquire);
         if drops != seen_drops {
             // Frames are missing: every picture until the next IDR would
@@ -229,18 +287,32 @@ fn decode_thread(
                 cams.remove(&id);
             }
             Dec::Restart { id } => {
-                let st = cams.entry(id).or_insert(DecoderState {
-                    decoder: None,
-                    last_key_request: None,
-                });
-                st.decoder = None;
+                // The decoder is kept: apps pause and start again while
+                // they negotiate, and a reset after the host's IDR would
+                // break the stream until the next one. A new host stream
+                // starts with an IDR and its parameter sets anyway.
+                let st = cams.entry(id).or_default();
                 st.last_key_request = None;
+                // One file per camera and agent run: a restart appends.
+                if let Some(dir) = dump_dir.as_ref().filter(|_| st.dump.is_none()) {
+                    let path = dir.join(format!("camera-{id}.h264"));
+                    match std::fs::File::create(&path) {
+                        Ok(f) => {
+                            tracing::info!("camera stream dumped to {}", path.display());
+                            st.dump = Some(f);
+                        }
+                        Err(e) => tracing::warn!("cannot dump to {}: {e}", path.display()),
+                    }
+                }
             }
             Dec::Frame { id, data } => {
-                let st = cams.entry(id).or_insert(DecoderState {
-                    decoder: None,
-                    last_key_request: None,
-                });
+                let st = cams.entry(id).or_default();
+                st.stats.received += 1;
+                st.stats.bytes += data.len() as u64;
+                if let Some(f) = &mut st.dump {
+                    use std::io::Write;
+                    let _ = f.write_all(&data);
+                }
                 if st.decoder.is_none() {
                     let created = load_openh264().and_then(|api| {
                         Decoder::with_api_config(api, DecoderConfig::new())
@@ -258,6 +330,8 @@ fn decode_thread(
                 match decoder.decode(&data) {
                     Ok(Some(yuv)) => {
                         let (w, h) = yuv.dimensions();
+                        st.stats.pictures += 1;
+                        st.stats.size = Some((w, h));
                         let picture = Pw::Picture {
                             id,
                             width: w as u32,
@@ -271,6 +345,8 @@ fn decode_thread(
                     Ok(None) => {}
                     Err(e) => {
                         tracing::debug!(id, "H.264 decode error: {e}");
+                        st.stats.errors += 1;
+                        st.stats.first_error.get_or_insert_with(|| e.to_string());
                         st.decoder = None;
                         key_frame(id, st);
                     }
@@ -322,8 +398,50 @@ struct CamState {
     /// The format the app chose, and its size.
     format: Option<(usize, u32, u32)>,
     streaming: bool,
+    size_warned: bool,
+    /// The sequence number of the next buffer.
+    seq: u64,
+    /// The graph's position, which the node drives: PipeWire's area,
+    /// valid while set, used on this thread only.
+    position: *mut spa::sys::spa_io_position,
+    /// Buffers given to PipeWire since the last log: with a picture,
+    /// without one, and the times no buffer was free.
+    filled: u64,
+    empty: u64,
+    no_buffer: u64,
+    held: u64,
+    last_log: Option<Instant>,
     /// The last picture, waiting for the next `process`.
     picture: Option<(u32, u32, Vec<u8>)>,
+}
+
+impl CamState {
+    /// Moves the graph's clock on by one picture, as a driver must: the
+    /// apps' clocks follow it. Nothing else updates it for a stream.
+    fn advance_clock(&mut self) {
+        if self.position.is_null() {
+            return;
+        }
+        let (num, den) = self
+            .format
+            .and_then(|(i, _, _)| self.formats.get(i))
+            .map_or((30, 1), |f| (f.2.max(1), f.3.max(1)));
+        let now = monotonic_ns() as u64;
+        let period = 1_000_000_000u64 * u64::from(den) / u64::from(num);
+        // SAFETY: PipeWire's area, given by io_changed and not removed
+        // since; the callbacks and this run on the same loop.
+        let clock = unsafe { &mut (*self.position).clock };
+        clock.nsec = now;
+        clock.rate = spa::sys::spa_fraction {
+            num: den,
+            denom: num,
+        };
+        clock.position = self.seq;
+        clock.duration = 1;
+        clock.delay = 0;
+        clock.rate_diff = 1.0;
+        clock.next_nsec = now + period;
+    }
 }
 
 struct Cam {
@@ -397,6 +515,9 @@ fn pw_thread(
                 let streaming = {
                     let mut st = cam.state.borrow_mut();
                     st.picture = Some((width, height, data));
+                    if st.streaming {
+                        st.advance_clock();
+                    }
                     st.streaming
                 };
                 if streaming && let Err(e) = cam.stream.trigger_process() {
@@ -475,10 +596,13 @@ fn buffers(width: u32, height: u32) -> Vec<u8> {
                 spa::sys::SPA_PARAM_BUFFERS_buffers,
                 Value::Choice(ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
+                    // Apps keep the last pictures they show (GTK keeps
+                    // them as textures on our memory): with few buffers,
+                    // none is left for the next picture.
                     ChoiceEnum::Range {
-                        default: 4,
-                        min: 2,
-                        max: 8,
+                        default: 16,
+                        min: 8,
+                        max: 32,
                     },
                 ))),
             ),
@@ -490,6 +614,51 @@ fn buffers(width: u32, height: u32) -> Vec<u8> {
             int(spa::sys::SPA_PARAM_BUFFERS_stride, width as i32),
         ],
     })
+}
+
+/// Asks for a header on each buffer, for the picture's time.
+fn header_meta() -> Vec<u8> {
+    use spa::pod::{Property, Value};
+    serialize(spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            Property::new(
+                spa::sys::SPA_PARAM_META_type,
+                Value::Id(spa::utils::Id(spa::sys::SPA_META_Header)),
+            ),
+            Property::new(
+                spa::sys::SPA_PARAM_META_size,
+                Value::Int(std::mem::size_of::<spa::sys::spa_meta_header>() as i32),
+            ),
+        ],
+    })
+}
+
+/// The header of `buf`, when it has one.
+///
+/// # Safety
+/// `buf` is a buffer PipeWire gave and that is not queued back yet.
+unsafe fn header<'a>(buf: *mut spa::sys::spa_buffer) -> Option<&'a mut spa::sys::spa_meta_header> {
+    let size = std::mem::size_of::<spa::sys::spa_meta_header>() as u32;
+    unsafe {
+        if buf.is_null() || (*buf).metas.is_null() {
+            return None;
+        }
+        let metas = std::slice::from_raw_parts((*buf).metas, (*buf).n_metas as usize);
+        metas
+            .iter()
+            .find(|m| m.type_ == spa::sys::SPA_META_Header && m.size >= size && !m.data.is_null())
+            .map(|m| &mut *m.data.cast::<spa::sys::spa_meta_header>())
+    }
+}
+
+/// `CLOCK_MONOTONIC`, PipeWire's clock, in nanoseconds.
+fn monotonic_ns() -> i64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    t.tv_sec
+        .saturating_mul(1_000_000_000)
+        .saturating_add(t.tv_nsec)
 }
 
 fn create(
@@ -518,10 +687,18 @@ fn create(
         formats: formats.clone(),
         format: None,
         streaming: false,
+        size_warned: false,
+        seq: 0,
+        position: std::ptr::null_mut(),
+        filled: 0,
+        empty: 0,
+        no_buffer: 0,
+        held: 0,
+        last_log: None,
         picture: None,
     }));
     let listener = {
-        let (s1, s2, s3) = (state.clone(), state.clone(), state.clone());
+        let (s1, s2, s3, s4) = (state.clone(), state.clone(), state.clone(), state.clone());
         let events2 = events.clone();
         stream
             .add_local_listener_with_user_data(())
@@ -553,10 +730,17 @@ fn create(
                 // update_params may call back: the state is not borrowed.
                 drop(st);
                 let bytes = buffers(size.width, size.height);
-                if let Some(pod) = spa::pod::Pod::from_bytes(&bytes)
-                    && let Err(e) = stream.update_params(&mut [pod])
+                let meta = header_meta();
+                let pods = [&bytes, &meta].map(|b| spa::pod::Pod::from_bytes(b));
+                if let [Some(b), Some(m)] = pods
+                    && let Err(e) = stream.update_params(&mut [b, m])
                 {
                     tracing::warn!(id, "cannot set the camera buffers: {e}");
+                }
+            })
+            .io_changed(move |_, _, id, area, _size| {
+                if id == spa::sys::SPA_IO_Position {
+                    s4.borrow_mut().position = area.cast();
                 }
             })
             .state_changed(move |_, _, old, new| {
@@ -584,33 +768,94 @@ fn create(
                 let _ = events2.send(Event::Stream { id: st.id, format });
             })
             .process(move |stream, _| {
-                let Some(mut buffer) = stream.dequeue_buffer() else {
-                    return;
-                };
                 let mut st = s3.borrow_mut();
+                let since = *st.last_log.get_or_insert_with(Instant::now);
+                if since.elapsed() >= STATS_INTERVAL {
+                    tracing::info!(
+                        id = st.id,
+                        filled = st.filled,
+                        empty = st.empty,
+                        no_buffer = st.no_buffer,
+                        held = st.held,
+                        "camera node stats (5 s)"
+                    );
+                    st.held = 0;
+                    st.filled = 0;
+                    st.empty = 0;
+                    st.no_buffer = 0;
+                    st.last_log = Some(Instant::now());
+                }
+                // One buffer at a time in the graph: a slow app (GTK takes
+                // its time to show a picture) would otherwise leave our
+                // buffers piling up in the queue, until none is free. The
+                // picture waits for the next cycle; a newer one replaces it.
+                if st.picture.is_some() && stream.time().is_ok_and(|t| t.queued_buffers() > 0) {
+                    st.held += 1;
+                    return;
+                }
+                // The raw buffer: its header is written too, which the
+                // safe wrapper does not allow.
+                let raw = unsafe { stream.dequeue_raw_buffer() };
+                if raw.is_null() {
+                    st.no_buffer += 1;
+                    return;
+                }
+                let spa_buf = unsafe { (*raw).buffer };
+                // Each picture's time: without it, apps take the graph's
+                // clock, which a driver triggered by hand does not move,
+                // and drop every picture after the first as a duplicate.
+                if let Some(h) = unsafe { header(spa_buf) } {
+                    h.pts = monotonic_ns();
+                    h.dts_offset = 0;
+                    h.flags = 0;
+                    h.seq = st.seq;
+                    st.seq = st.seq.wrapping_add(1);
+                }
+                let data = unsafe {
+                    if (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() {
+                        stream.queue_raw_buffer(raw);
+                        return;
+                    }
+                    &mut *(*spa_buf).datas
+                };
                 let expected = st.format.map(|(_, w, h)| (w, h));
                 let picture = st.picture.take();
-                let datas = buffer.datas_mut();
-                let Some(data) = datas.first_mut() else {
-                    return;
-                };
                 let mut written = 0;
                 let mut stride = 0;
                 if let Some((w, h, pixels)) = picture {
                     if Some((w, h)) != expected {
-                        tracing::debug!(id = st.id, w, h, "picture size differs from the format");
-                    } else if let Some(target) = data.data()
-                        && target.len() >= pixels.len()
-                    {
-                        target[..pixels.len()].copy_from_slice(&pixels);
+                        if !st.size_warned {
+                            st.size_warned = true;
+                            tracing::warn!(
+                                id = st.id,
+                                w,
+                                h,
+                                ?expected,
+                                "decoded pictures differ from the format the app chose"
+                            );
+                        }
+                    } else if !data.data.is_null() && data.maxsize as usize >= pixels.len() {
+                        // MAP_BUFFERS: the memory is mapped, `maxsize` long.
+                        let target = unsafe {
+                            std::slice::from_raw_parts_mut(data.data.cast::<u8>(), pixels.len())
+                        };
+                        target.copy_from_slice(&pixels);
                         written = pixels.len();
                         stride = w as i32;
                     }
                 }
-                let chunk = data.chunk_mut();
-                *chunk.offset_mut() = 0;
-                *chunk.size_mut() = written as u32;
-                *chunk.stride_mut() = stride;
+                if written > 0 {
+                    st.filled += 1;
+                } else {
+                    st.empty += 1;
+                }
+                if let Some(chunk) = unsafe { data.chunk.as_mut() } {
+                    chunk.offset = 0;
+                    chunk.size = written as u32;
+                    chunk.stride = stride;
+                    chunk.flags = 0;
+                }
+                unsafe { stream.queue_raw_buffer(raw) };
             })
             .register()?
     };
@@ -696,6 +941,7 @@ mod tests {
     fn pods_serialize() {
         assert!(spa::pod::Pod::from_bytes(&enum_format(&(640, 480, 30, 1))).is_some());
         assert!(spa::pod::Pod::from_bytes(&buffers(640, 480)).is_some());
+        assert!(spa::pod::Pod::from_bytes(&header_meta()).is_some());
     }
 
     /// Creates a camera on the session's PipeWire: needs a running
@@ -723,6 +969,150 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("ameleo-camera-42"), "{text}");
+        cams.remove(42);
+    }
+
+    /// Replays a dumped H.264 stream (`AMELEO_REPLAY=<file>`, 1080p30)
+    /// to a clock-synced consumer, and checks the pictures it gets.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn replay() {
+        let out = std::env::var("AMELEO_REPLAY_OUT").expect("AMELEO_REPLAY_OUT");
+        let d = match std::env::var("AMELEO_REPLAY") {
+            Ok(path) => std::fs::read(path).unwrap(),
+            // A moving picture, through the same library.
+            Err(_) => {
+                let mut enc = openh264::encoder::Encoder::with_api_config(
+                    load_openh264().unwrap(),
+                    openh264::encoder::EncoderConfig::new(),
+                )
+                .unwrap();
+                let mut stream = Vec::new();
+                for n in 0..120usize {
+                    let mut yuv = vec![128u8; 1920 * 1080 * 3 / 2];
+                    for (i, p) in yuv[..1920 * 1080].iter_mut().enumerate() {
+                        *p = ((i % 1920 + n * 8) % 256) as u8;
+                    }
+                    let buf = openh264::formats::YUVBuffer::from_vec(yuv, 1920, 1080);
+                    stream.extend(enc.encode(&buf).unwrap().to_vec());
+                }
+                stream
+            }
+        };
+        // Access units: SPS + PPS + IDR, then one NAL each.
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while let Some(j) = d[i..].windows(3).position(|w| w == [0, 0, 1]) {
+            let s = i + j;
+            let s = if s > 0 && d[s - 1] == 0 { s - 1 } else { s };
+            starts.push(s);
+            i = i + j + 3;
+        }
+        // A new unit at each slice; SPS and PPS go with the slice after.
+        let mut merged: Vec<Vec<u8>> = Vec::new();
+        let mut current: Vec<u8> = Vec::new();
+        let mut has_slice = false;
+        for (k, &s) in starts.iter().enumerate() {
+            let e = starts.get(k + 1).copied().unwrap_or(d.len());
+            let nal = &d[s..e];
+            let ty = nal[nal.iter().position(|&b| b == 1).unwrap() + 1] & 0x1f;
+            let slice = ty == 1 || ty == 5;
+            if (slice || ty == 7) && has_slice {
+                merged.push(std::mem::take(&mut current));
+                has_slice = false;
+            }
+            current.extend_from_slice(nal);
+            has_slice |= slice;
+        }
+        merged.push(current);
+        eprintln!("{} access units", merged.len());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cams = Cameras::spawn(tx).unwrap();
+        cams.add(42, "replay".into(), vec![(1920, 1080, 30, 1)])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // AMELEO_REPLAY_SECS: no test app, serve whatever app opens the
+        // camera for that long (to try real apps).
+        if let Some(secs) = std::env::var("AMELEO_REPLAY_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            eprintln!("camera ready for {secs} s");
+            let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+            let mut started = false;
+            for au in merged.iter().cycle() {
+                if tokio::time::Instant::now() >= end {
+                    break;
+                }
+                while let Ok(ev) = rx.try_recv() {
+                    eprintln!("event {ev:?}");
+                    if let Event::Stream { format, .. } = ev {
+                        started = format.is_some();
+                    }
+                }
+                if started {
+                    cams.push(42, au.clone());
+                }
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+            cams.remove(42);
+            return;
+        }
+        let mut app = tokio::process::Command::new("gst-launch-1.0")
+            .args([
+                "-v",
+                "pipewiresrc",
+                "target-object=ameleo-camera-42",
+                "stream-properties=props,media.type=Video,media.category=Capture,media.role=Camera",
+                "num-buffers=40",
+                "!",
+                "identity",
+                "silent=false",
+                "!",
+                "queue",
+                "!",
+                "filesink",
+                "sync=true",
+                &format!("location={out}"),
+            ])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+            {
+                Some(Event::Stream {
+                    format: Some(_), ..
+                }) => break,
+                other => eprintln!("event {other:?}"),
+            }
+        }
+        let push = async {
+            for au in merged.iter().cycle() {
+                cams.push(42, au.clone());
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+        };
+        let status = tokio::select! {
+            s = app.wait() => s.unwrap(),
+            _ = push => unreachable!(),
+            _ = tokio::time::sleep(Duration::from_secs(15)) => panic!("the app got no pictures"),
+        };
+        assert!(status.success());
+        let got = std::fs::read(&out).unwrap();
+        let frame = 1920 * 1080 * 3 / 2;
+        eprintln!(
+            "got {} bytes = {} frames",
+            got.len(),
+            got.len() as f64 / frame as f64
+        );
+        let last = &got[got.len() - frame..got.len() - frame + 1920 * 1080];
+        let mean = last.iter().map(|&b| b as f64).sum::<f64>() / last.len() as f64;
+        let var = last.iter().map(|&b| (b as f64 - mean).powi(2)).sum::<f64>() / last.len() as f64;
+        eprintln!("last picture luma mean {mean:.1} variance {var:.1}");
         cams.remove(42);
     }
 }
