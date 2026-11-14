@@ -416,8 +416,14 @@ struct CamState {
 }
 
 impl CamState {
-    /// Moves the graph's clock on by one picture, as a driver must: the
-    /// apps' clocks follow it. Nothing else updates it for a stream.
+    /// Moves the graph's clock on, as a driver must: the apps' clocks
+    /// follow it, and nothing else updates it for a stream.
+    ///
+    /// The position is in nanoseconds of `CLOCK_MONOTONIC`, the time base
+    /// of the pictures' timestamps. Counted in pictures instead, the clock
+    /// would fall behind the timestamps with every picture the client
+    /// skips or the app does not take, until the app waits forever for
+    /// pictures it thinks are early, holding all our buffers.
     fn advance_clock(&mut self) {
         if self.position.is_null() {
             return;
@@ -433,11 +439,11 @@ impl CamState {
         let clock = unsafe { &mut (*self.position).clock };
         clock.nsec = now;
         clock.rate = spa::sys::spa_fraction {
-            num: den,
-            denom: num,
+            num: 1,
+            denom: 1_000_000_000,
         };
-        clock.position = self.seq;
-        clock.duration = 1;
+        clock.position = now;
+        clock.duration = period;
         clock.delay = 0;
         clock.rate_diff = 1.0;
         clock.next_nsec = now + period;
@@ -977,7 +983,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn replay() {
-        let out = std::env::var("AMELEO_REPLAY_OUT").expect("AMELEO_REPLAY_OUT");
+        // AMELEO_REPLAY_OUT: where the test app writes what it gets (the
+        // last picture is then checked); without it, the app only syncs.
+        let out = std::env::var("AMELEO_REPLAY_OUT").ok();
         let d = match std::env::var("AMELEO_REPLAY") {
             Ok(path) => std::fs::read(path).unwrap(),
             // A moving picture, through the same library.
@@ -1026,6 +1034,16 @@ mod tests {
         }
         merged.push(current);
         eprintln!("{} access units", merged.len());
+        // AMELEO_REPLAY_INTERVAL_MS: the client's pace (33 by default),
+        // AMELEO_REPLAY_FRAMES: the pictures the test app waits for (40).
+        let env = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        };
+        let interval = Duration::from_millis(env("AMELEO_REPLAY_INTERVAL_MS", 33));
+        let frames = env("AMELEO_REPLAY_FRAMES", 40);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cams = Cameras::spawn(tx).unwrap();
         cams.add(42, "replay".into(), vec![(1920, 1080, 30, 1)])
@@ -1054,7 +1072,7 @@ mod tests {
                 if started {
                     cams.push(42, au.clone());
                 }
-                tokio::time::sleep(Duration::from_millis(33)).await;
+                tokio::time::sleep(interval).await;
             }
             cams.remove(42);
             return;
@@ -1065,16 +1083,21 @@ mod tests {
                 "pipewiresrc",
                 "target-object=ameleo-camera-42",
                 "stream-properties=props,media.type=Video,media.category=Capture,media.role=Camera",
-                "num-buffers=40",
+                &format!("num-buffers={frames}"),
                 "!",
                 "identity",
                 "silent=false",
                 "!",
                 "queue",
                 "!",
-                "filesink",
+                if out.is_some() {
+                    "filesink"
+                } else {
+                    "fakesink"
+                },
                 "sync=true",
-                &format!("location={out}"),
+                &out.as_ref()
+                    .map_or("silent=true".into(), |o| format!("location={o}")),
             ])
             .kill_on_drop(true)
             .spawn()
@@ -1093,15 +1116,19 @@ mod tests {
         let push = async {
             for au in merged.iter().cycle() {
                 cams.push(42, au.clone());
-                tokio::time::sleep(Duration::from_millis(33)).await;
+                tokio::time::sleep(interval).await;
             }
         };
         let status = tokio::select! {
             s = app.wait() => s.unwrap(),
             _ = push => unreachable!(),
-            _ = tokio::time::sleep(Duration::from_secs(15)) => panic!("the app got no pictures"),
+            _ = tokio::time::sleep(interval * frames as u32 * 2 + Duration::from_secs(5)) => panic!("the app stopped taking pictures"),
         };
         assert!(status.success());
+        let Some(out) = out else {
+            cams.remove(42);
+            return;
+        };
         let got = std::fs::read(&out).unwrap();
         let frame = 1920 * 1080 * 3 / 2;
         eprintln!(
