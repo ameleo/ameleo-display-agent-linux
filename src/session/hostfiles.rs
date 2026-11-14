@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
+    AccessFlags, BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
+    FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyXattr, Request,
 };
 use proto::file_contents::MAX_RANGE;
 
@@ -32,6 +32,7 @@ use super::filelist::Entry;
 
 /// Host lists kept readable.
 const KEPT: usize = 4;
+const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
 const TTL: Duration = Duration::from_secs(1);
 
 /// Reads `len` bytes at `position` of file `lindex` of the list locked as
@@ -54,6 +55,8 @@ struct Node {
     children: Vec<u64>,
     /// The file in the host list: `(clip_data_id, lindex)`.
     host: Option<(u32, i32)>,
+    /// Read-only on the client (`FILE_ATTRIBUTE_READONLY`).
+    readonly: bool,
 }
 
 struct Tree {
@@ -78,6 +81,7 @@ impl Tree {
                 mtime: SystemTime::now(),
                 children: Vec::new(),
                 host: None,
+                readonly: false,
             },
         );
         Self {
@@ -131,7 +135,13 @@ impl Tree {
             } else {
                 FileType::RegularFile
             },
-            perm: if n.dir { 0o555 } else { 0o444 },
+            // The modes the pasted copies get: file managers keep them. The
+            // mount is read-only anyway.
+            perm: match (n.dir, n.readonly) {
+                (true, _) => 0o755,
+                (false, true) => 0o444,
+                (false, false) => 0o644,
+            },
             nlink: if n.dir { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
@@ -153,6 +163,7 @@ impl Tree {
             mtime: now,
             children: Vec::new(),
             host: None,
+            readonly: false,
         };
         let root = self.insert(INodeNo::ROOT.0, dir);
         let mut tops = Vec::new();
@@ -185,6 +196,7 @@ impl Tree {
                 mtime: if e.write_time == 0 { now } else { e.mtime() },
                 children: Vec::new(),
                 host: (!e.is_dir()).then_some((clip_data_id, lindex as i32)),
+                readonly: e.attributes & FILE_ATTRIBUTE_READONLY != 0,
             };
             let ino = self.insert(parent, node);
             if e.is_dir() {
@@ -298,6 +310,37 @@ impl Filesystem for Fs {
             }
             reply.data(&data);
         });
+    }
+
+    /// Everything can be read, nothing written.
+    fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        if !self.tree.lock().unwrap().nodes.contains_key(&ino.0) {
+            reply.error(Errno::ENOENT);
+        } else if mask.contains(AccessFlags::W_OK) {
+            reply.error(Errno::EROFS);
+        } else {
+            reply.ok();
+        }
+    }
+
+    /// No extended attributes, no ACLs.
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        reply.error(Errno::NO_XATTR);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
     }
 
     /// Nothing to write back: read only.
@@ -456,11 +499,24 @@ mod tests {
         let b = t.child(s, OsStr::new("b")).unwrap();
         assert_eq!(t.nodes[&b].host, Some((7, 3)));
         assert_eq!(t.attr(d).unwrap().kind, FileType::Directory);
+        assert_eq!(t.attr(d).unwrap().perm, 0o755);
+        assert_eq!(t.attr(b).unwrap().perm, 0o644);
         assert!(t.child(root, OsStr::new("orphan")).is_none());
         assert_eq!(
             t.nodes[&t.child(root, OsStr::new("top.bin")).unwrap()].host,
             Some((7, 5))
         );
+    }
+
+    #[test]
+    fn read_only_files_stay_read_only() {
+        let mut t = Tree::new();
+        let mut ro = entry("ro.txt", false, 1);
+        ro.attributes = 0x21; // READONLY | ARCHIVE
+        t.add_list(1, &[ro, entry("rw.txt", false, 1)]);
+        let root = t.child(INodeNo::ROOT.0, OsStr::new("1")).unwrap();
+        let perm = |n: &str| t.attr(t.child(root, OsStr::new(n)).unwrap()).unwrap().perm;
+        assert_eq!((perm("ro.txt"), perm("rw.txt")), (0o444, 0o644));
     }
 
     #[test]

@@ -774,6 +774,10 @@ mod tests {
         assert!(paths[0].starts_with(&runtime));
         let content = tokio::fs::read_to_string(&paths[0]).await.unwrap();
         assert_eq!(content, "hello from the host");
+        // Writable once copied: file managers keep the mode.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&paths[0]).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
 
         // Guest files copied for the host.
         let dir = std::env::temp_dir().join(format!("ada-live-files-{}", std::process::id()));
