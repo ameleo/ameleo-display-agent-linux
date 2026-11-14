@@ -1,0 +1,28 @@
+[Unit]
+Description=ameleo display agent (QEMU -display dbus guest agent)
+Documentation=https://github.com/ameleo/ameleo-display-agent-linux
+# Started by udev when the port appears (60-ameleo-display-agent.rules),
+# stopped when it goes away.
+BindsTo=dev-virtio\x2dports-fr.ameleo.agent.0.device
+After=dev-virtio\x2dports-fr.ameleo.agent.0.device systemd-logind.service
+
+[Service]
+ExecStart=/usr/bin/ameleo-display-agent daemon
+Restart=always
+RestartSec=2
+# /run/ameleo-display-agent/session.sock, for the session agents.
+RuntimeDirectory=ameleo-display-agent
+RuntimeDirectoryMode=0755
+# The desktop effects chosen by the host, kept across reboots.
+StateDirectory=ameleo-display-agent
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

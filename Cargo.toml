@@ -1,0 +1,30 @@
+[package]
+name = "ameleo-display-agent"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Linux guest agent for QEMU -display dbus: peer-to-peer D-Bus over virtio-serial"
+repository = "https://github.com/ameleo/ameleo-display-agent-linux"
+
+[[bin]]
+name = "ameleo-display-agent"
+path = "src/main.rs"
+
+[dependencies]
+# The D-Bus contract, imported as `proto`.
+proto = { package = "ameleo-display-protocol", git = "https://github.com/ameleo/ameleo-display-protocol", tag = "v0.1.0" }
+zbus = { version = "5", default-features = false, features = ["tokio", "p2p"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "signal", "fs", "process"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+rustix = { version = "1", features = ["fs", "event", "pipe", "process", "termios"] }
+evdev = "0.13"
+drm = "0.14"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
+dirs = "6"
+futures-util = { version = "0.3", default-features = false }

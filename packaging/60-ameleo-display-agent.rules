@@ -1,0 +1,2 @@
+# Starts the agent's daemon when QEMU's agent port shows up.
+ACTION=="add", SUBSYSTEM=="virtio-ports", ATTR{name}=="fr.ameleo.agent.0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ameleo-display-agent.service"

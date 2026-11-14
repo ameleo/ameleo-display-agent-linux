@@ -1,0 +1,7 @@
+{
+  "uuid": "ameleo-display-agent@ameleo.fr",
+  "name": "ameleo display agent",
+  "description": "Gives the clipboard to ameleo-display-agent, the guest agent of QEMU -display dbus virtual machines. Mutter has no data control protocol: the agent reaches the clipboard through this extension. Only the agent's own program may use it.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "url": "https://github.com/ameleo/ameleo-display-agent-linux"
+}

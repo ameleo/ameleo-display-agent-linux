@@ -1,0 +1,16 @@
+[Unit]
+Description=ameleo display agent, session part (clipboard, files, effects)
+Documentation=https://github.com/ameleo/ameleo-display-agent-linux
+# Only in a VM with the agent's port.
+ConditionPathExists=/dev/virtio-ports/fr.ameleo.agent.0
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/ameleo-display-agent session
+Restart=on-failure
+RestartSec=2
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target
