@@ -1,11 +1,11 @@
 # Changelog
 
-This file lists the changes in each release. The builds will be available on the
+This file lists the changes in each release. The builds are available on the
 [releases page](https://github.com/ameleo/ameleo-display-agent-linux/releases).
 
-## Unreleased
+## 0.1.0 — 2026-11-15
 
-The first version: a Linux guest agent for QEMU `-display dbus`, written in Rust, which replaces
+The first release: a Linux guest agent for QEMU `-display dbus`, written in Rust, which replaces
 spice-vdagent and implements
 [ameleo-display-protocol](https://github.com/ameleo/ameleo-display-protocol) 0.1.0. It talks to
 the host over one virtio-serial port, with a peer-to-peer D-Bus session and one versioned D-Bus
@@ -29,5 +29,6 @@ Wayland session (GNOME, Plasma or wlroots) handles the user's desktop.
 - **Display effects:** wallpaper, font smoothing and animations can be turned off on request, on
   GNOME and Plasma, and are restored afterwards.
 
-`make deploy` installs the agent with its systemd services and a udev rule that starts the
-daemon when the agent port appears. There are no distribution packages yet.
+The release has an RPM for Fedora, which installs the agent with its systemd services, the udev
+rule that starts the daemon when the agent port appears, and the CUPS backend; `make deploy`
+installs the same from the sources.

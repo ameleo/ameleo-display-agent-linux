@@ -60,7 +60,19 @@ client printers need CUPS and Ghostscript.
 
 ## Installing in the guest
 
-Build as yourself, then install as root:
+On Fedora, install the RPM of the
+[releases page](https://github.com/ameleo/ameleo-display-agent-linux/releases):
+
+```
+sudo dnf install ./ameleo-display-agent-0.1.0-1.fc44.x86_64.rpm
+```
+
+It brings CUPS, Ghostscript and FUSE with it; the client cameras also need `openh264`, from
+the `fedora-cisco-openh264` repository. The package enables the session agent for the
+graphical sessions of every user and starts the daemon if the agent port is there.
+`make rpm` builds the RPM and the source RPM from the Git tree, in `target/rpm`.
+
+From the sources, build as yourself, then install as root:
 
 ```
 make
@@ -322,7 +334,7 @@ setting.
 ## Not supported yet
 
 * X11 sessions, and the clipboard on the login screen.
-* Distribution packages (RPM and deb).
+* Packages for other distributions than Fedora (deb).
 
 ## License
 

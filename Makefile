@@ -3,6 +3,7 @@
 #   make                  build, as yourself
 #   sudo make deploy      install, and (re)start the services
 #   make restart-session  restart your session agent (no root needed)
+#   make rpm              build the RPM and the source RPM in target/rpm
 #
 # Run `sudo make deploy` again after each change: it puts the new binary in
 # place and restarts the daemon if it runs.
@@ -13,10 +14,12 @@ BINDIR = $(PREFIX)/bin
 LIBDIR = $(PREFIX)/lib
 DATADIR = $(PREFIX)/share
 EXTENSION = ameleo-display-agent@ameleo.fr
+VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+RPMDIR = $(CURDIR)/target/rpm
 # Where CUPS looks for its backends.
 CUPS_SERVERBIN ?= $(shell cups-config --serverbin 2>/dev/null || echo $(PREFIX)/lib/cups)
 
-.PHONY: all install setup deploy restart-session uninstall
+.PHONY: all install setup deploy restart-session uninstall rpm
 
 all:
 	cargo build --release --locked
@@ -58,3 +61,14 @@ uninstall:
 	rm -f $(DESTDIR)$(LIBDIR)/modules-load.d/ameleo-display-agent.conf
 	rm -rf $(DESTDIR)$(DATADIR)/gnome-shell/extensions/$(EXTENSION)
 	rm -f $(DESTDIR)$(CUPS_SERVERBIN)/backend/ameleo
+
+# The sources are the Git tree, uncommitted changes included. The spec's
+# version must be Cargo.toml's.
+rpm:
+	@grep -q '^Version: *$(VERSION)$$' packaging/ameleo-display-agent.spec || \
+		{ echo "ameleo-display-agent.spec: Version is not $(VERSION)"; exit 1; }
+	mkdir -p $(RPMDIR)/SOURCES
+	tree=$$(git stash create); git archive --format=tar.gz \
+		--prefix=ameleo-display-agent-$(VERSION)/ \
+		-o $(RPMDIR)/SOURCES/ameleo-display-agent-$(VERSION).tar.gz $${tree:-HEAD}
+	rpmbuild -ba --define "_topdir $(RPMDIR)" packaging/ameleo-display-agent.spec
