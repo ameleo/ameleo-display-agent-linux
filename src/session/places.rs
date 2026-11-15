@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! The client drives in the Places panel of KDE (Dolphin, the file
 //! dialogs): bookmarks in `~/.local/share/user-places.xbel`.

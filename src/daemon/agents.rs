@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! The session agents: one per graphical session, connected to
 //! [`crate::ipc::SOCKET`]. The daemon serves `fr.ameleo.DisplayAgent.Daemon1`

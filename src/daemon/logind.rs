@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! The seat0 session as systemd-logind sees it: who is in front of the
 //! screen, and whether it is locked.

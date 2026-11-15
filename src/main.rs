@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! ameleo-display-agent: Linux guest agent speaking peer-to-peer D-Bus over
 //! the virtio-serial port `fr.ameleo.agent.0`.

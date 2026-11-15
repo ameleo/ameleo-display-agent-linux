@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Host to guest file push into the user's Downloads folder
 //! (`XDG_DOWNLOAD_DIR`). The session agent runs as the user: the files are

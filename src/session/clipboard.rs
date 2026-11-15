@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! Clipboard types between the wire ([`proto::mime`]) and the guest apps.
 //!

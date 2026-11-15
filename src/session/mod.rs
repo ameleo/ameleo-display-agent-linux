@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! The session agent: runs as the user of a graphical session, connects to
 //! the daemon ([`crate::ipc::SOCKET`]) and does what needs the user's

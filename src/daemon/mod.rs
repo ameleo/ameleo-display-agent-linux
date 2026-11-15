@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! The system daemon: owns the virtio-serial port, serves the host's D-Bus
 //! session on it, injects the pointer, and hands the rest to the session

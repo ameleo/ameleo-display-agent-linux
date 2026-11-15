@@ -18,18 +18,14 @@ every pull request rejects commits without it. No contributor license agreement 
 
 ## License of contributions
 
-The agent is distributed under the GNU General Public License, version 3 or later. Every
-contribution is given under the MIT License or the Apache License 2.0, at the choice of whoever
-uses it; the GPL allows the project to distribute code under those licenses. This lets the
-project change its license later, for example to a permissive license or under a foundation,
-without having to find every contributor again. Whatever license the agent moves to, it will
-stay open source, under a license approved by the Open Source Initiative. By signing off a
-commit, you certify the Developer Certificate of Origin for it and license it under those terms.
+The agent is distributed under the GNU General Public License, version 3 only, and every
+contribution is given under that same license. By signing off a commit, you certify the
+Developer Certificate of Origin for it and license it under the GPL version 3.
 
 New source files start with this line:
 
 ```rust
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 ```
 
 Changes to a D-Bus interface go to

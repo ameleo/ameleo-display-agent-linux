@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! The GNOME clipboard, through the agent's GNOME Shell extension
 //! (`gnome-shell-extension/`): Mutter has no data control protocol, the

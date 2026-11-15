@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! D-Bus interfaces the daemon serves to the host (see the `proto` crate for
 //! the contract). The pointer is handled here; the clipboard, the files and

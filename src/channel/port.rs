@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-only
 
 //! virtio-serial port I/O: `/dev/virtio-ports/<name>`.
 //!

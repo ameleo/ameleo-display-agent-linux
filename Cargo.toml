@@ -2,7 +2,7 @@
 name = "ameleo-display-agent"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 description = "Linux guest agent for QEMU -display dbus: peer-to-peer D-Bus over virtio-serial"
 repository = "https://github.com/ameleo/ameleo-display-agent-linux"
 
