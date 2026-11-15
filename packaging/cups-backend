@@ -1,0 +1,4 @@
+#!/bin/sh
+# The "ameleo" CUPS backend: the jobs of the client printers, handed to the
+# ameleo display agent. Installed with mode 0755, so CUPS runs it as lp.
+exec /usr/bin/ameleo-display-agent cups-backend "$@"

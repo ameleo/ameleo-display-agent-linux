@@ -377,6 +377,20 @@ impl SessionIface {
         self.0.xfer.lock().unwrap().cancel(id)
     }
 
+    /// `lpoptions -d`: the user's own default, in `~/.cups/lpoptions`.
+    async fn set_default_printer(&self, queue: &str) {
+        let res = tokio::process::Command::new("lpoptions")
+            .args(["-d", queue])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .await;
+        match res {
+            Ok(s) if s.success() => tracing::info!(queue, "default printer"),
+            Ok(s) => tracing::warn!(queue, "lpoptions -d failed: {s}"),
+            Err(e) => tracing::warn!(queue, "lpoptions: {e}"),
+        }
+    }
+
     async fn reset(&self) {
         tracing::info!("host session reset");
         self.0.xfer.lock().unwrap().reset();

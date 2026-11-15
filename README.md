@@ -38,9 +38,10 @@ The modules of `src`, by feature:
 | `channel/` | The virtio-serial port and the D-Bus sessions on it |
 | `daemon/` | The host's interfaces, the uinput pointer, logind and the session agents |
 | `session/` | The clipboard (Wayland or GNOME Shell), the file clipboard, the client cameras (PipeWire), the client drives (FUSE), the monitors, file transfer and desktop effects |
+| `cups_backend` | The `ameleo` CUPS backend, which hands the client printers' jobs to the daemon |
 
 `gnome-shell-extension/` holds the GNOME Shell extension that gives the clipboard to the agent
-on GNOME, and `packaging/` the systemd units and the udev rule.
+on GNOME, and `packaging/` the systemd units, the udev rule and the CUPS backend.
 
 ## Building
 
@@ -54,7 +55,8 @@ make
 At run time, the client cameras need PipeWire and the Cisco OpenH264 library (Fedora: the
 `openh264` package, from the `fedora-cisco-openh264` repository that Fedora enables by default),
 version 2.6 or later. Without it, the agent works, but `AddCamera` fails. The file clipboard and
-the client drives need FUSE 3 (`/dev/fuse` and `fusermount3`, from the `fuse3` package).
+the client drives need FUSE 3 (`/dev/fuse` and `fusermount3`, from the `fuse3` package). The
+client printers need CUPS and Ghostscript.
 
 ## Installing in the guest
 
@@ -249,6 +251,34 @@ list only disks and a few network file systems.
 
 Without FUSE, `AddDrive` fails; the rest works.
 
+### Printers
+
+Each client printer becomes a CUPS queue named after it (`HP_LaserJet_redirection_2`, with the
+client's name as its description), so every print dialog lists it.
+
+* **Options.** The queue's PPD is made from the client driver's PrintCapabilities: paper sizes,
+  two-sided printing, color, trays, media types and the driver's own features, with the
+  display names the driver gives and the defaults of its default PrintTicket. The standard
+  ones use CUPS's names (`PageSize`, `Duplex`, `ColorModel`, `InputSlot`...), so the dialogs
+  show them in their usual places. CUPS itself makes the copies, n-up and page ranges.
+* **Jobs.** CUPS gives each job as PDF to the agent's `ameleo` backend, which it runs as `lp`.
+  The backend makes an XPS document of it with Ghostscript (`xpswrite`) and hands it to the
+  daemon over `/run/ameleo-display-agent/print.sock`, which only root and `lp` may use. The
+  daemon moves the document to OpenXPS, the format Windows makes and the host expects, and
+  writes the job's PrintTicket into it (`Metadata/Job_PT.xml`): the client's
+  default ticket, with the options chosen in the dialog put in. The driver's other settings,
+  its `PageDevmodeSnapshot` among them, stay as they are. The document goes to the host in
+  256 KiB chunks (`BeginJob`, `WriteJob`, `EndJob`).
+* **One user.** Only the user in front of the screen may print to the queues
+  (`lpadmin -u allow:`); they follow that user. The client's default printer becomes that
+  user's default (`lpoptions -d`).
+* **Sessions.** When the host session ends, the queues are disabled for 60 seconds: a printer
+  of the same name in the next session takes its queue over, and the others are deleted.
+  `RemovePrinter` deletes the queue at once, and the daemon deletes queues that a previous
+  daemon left when it starts.
+* **Preferences.** The client driver's own dialog (`DocumentProperties`) cannot be opened:
+  Linux print dialogs have no place for it. Its options are in the dialogs' advanced settings.
+
 ### File transfer
 
 * Files are saved in the user's Downloads folder (`XDG_DOWNLOAD_DIR`), as the user. When the
@@ -287,7 +317,6 @@ setting.
 
 ## Not supported yet
 
-* Client printers. The agent does not list them in `Agent1.Channels`.
 * X11 sessions, and the clipboard on the login screen.
 * Distribution packages (RPM and deb).
 

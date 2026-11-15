@@ -6,9 +6,11 @@
 //! ```text
 //! ameleo-display-agent daemon    system daemon (root): the port, the pointer
 //! ameleo-display-agent session   session agent (the user): clipboard, files, effects
+//! ameleo-display-agent cups-backend ...   the CUPS backend of the client printers
 //! ```
 
 mod channel;
+mod cups_backend;
 mod daemon;
 mod ipc;
 mod session;
@@ -32,6 +34,14 @@ fn init_logging() {
 
 fn main() -> anyhow::Result<()> {
     let arg = std::env::args().nth(1).unwrap_or_default();
+    if arg == "cups-backend" {
+        // Run by CUPS: its messages on stderr, no logging setup.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        std::process::exit(rt.block_on(cups_backend::run(&args)));
+    }
     let role = match arg.as_str() {
         "daemon" | "session" => arg,
         "--version" | "-V" => {

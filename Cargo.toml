@@ -32,3 +32,5 @@ pipewire = { version = "0.10", features = ["v0_3_50"] }
 # H.264 decoding with the system's Cisco libopenh264, loaded at run time.
 openh264 = { version = "0.9", default-features = false, features = ["libloading"] }
 futures-util = { version = "0.3", default-features = false }
+quick-xml = "0.38"
+zip = { version = "9.6.0", default-features = false, features = ["deflate"] }

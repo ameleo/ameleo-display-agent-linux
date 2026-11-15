@@ -26,6 +26,16 @@ pub fn socket() -> std::path::PathBuf {
         .map(Into::into)
         .unwrap_or_else(|| SOCKET.into())
 }
+/// Where the CUPS backend hands jobs to the daemon.
+pub const PRINT_SOCKET: &str = "/run/ameleo-display-agent/print.sock";
+
+/// [`PRINT_SOCKET`], or `AMELEO_DISPLAY_AGENT_PRINT_SOCKET` (tests).
+pub fn print_socket() -> std::path::PathBuf {
+    std::env::var_os("AMELEO_DISPLAY_AGENT_PRINT_SOCKET")
+        .map(Into::into)
+        .unwrap_or_else(|| PRINT_SOCKET.into())
+}
+pub const PRINT_PATH: &str = "/fr/ameleo/DisplayAgent/Print";
 pub const SESSION_PATH: &str = "/fr/ameleo/DisplayAgent/Session";
 pub const DAEMON_PATH: &str = "/fr/ameleo/DisplayAgent/Daemon";
 
@@ -80,6 +90,29 @@ pub trait Session {
     /// The host session ended or the client went away: drop the host
     /// clipboard and abort the transfers.
     fn reset(&self) -> zbus::Result<()>;
+
+    /// The client's default printer: the user's default CUPS queue.
+    fn set_default_printer(&self, queue: &str) -> zbus::Result<()>;
+}
+
+/// What the CUPS backend calls on [`PRINT_SOCKET`], at [`PRINT_PATH`].
+#[zbus::proxy(
+    interface = "fr.ameleo.DisplayAgent.Print1",
+    default_service = "fr.ameleo.DisplayAgent.Daemon",
+    default_path = "/fr/ameleo/DisplayAgent/Print",
+    gen_blocking = false
+)]
+pub trait Print {
+    /// `document`: the job as an XPS document, without ticket; `options`:
+    /// the CUPS job options.
+    fn submit(
+        &self,
+        queue: &str,
+        title: &str,
+        user: &str,
+        options: &str,
+        document: zbus::zvariant::Fd<'_>,
+    ) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(

@@ -8,6 +8,9 @@ mod agents;
 mod host;
 mod logind;
 mod mouse;
+pub(crate) mod printcaps;
+mod printers;
+mod xps;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -24,7 +27,7 @@ use crate::channel::transport;
 use agents::Agent;
 use host::{
     AgentIface, CameraIface, ClipboardIface, DisplayIface, DriveIface, FileClipboardIface,
-    FileTransferIface, MouseIface,
+    FileTransferIface, MouseIface, PrinterIface,
 };
 use mouse::MouseHandle;
 
@@ -144,6 +147,8 @@ pub struct Shared {
     guest_released: AtomicBool,
     /// The client cameras, by id.
     cameras: Mutex<std::collections::BTreeMap<u32, CameraInfo>>,
+    /// The client printers.
+    printers: Arc<printers::Printers>,
     /// The client drives, by id.
     drives: Mutex<std::collections::BTreeMap<u32, DriveInfo>>,
     effects: Mutex<Effects>,
@@ -174,6 +179,7 @@ impl Shared {
             guest_released: AtomicBool::new(false),
             cameras: Mutex::new(Default::default()),
             drives: Mutex::new(Default::default()),
+            printers: Arc::default(),
             effects: Mutex::new(Effects::load()),
             transfers: Mutex::new(HashMap::new()),
             next_transfer: AtomicU32::new(0),
@@ -190,6 +196,22 @@ impl Shared {
         self.current.lock().unwrap().clone()
     }
 
+    /// The user in front of the screen.
+    pub fn active_uid(&self) -> Option<u32> {
+        self.active.lock().unwrap().uid
+    }
+
+    /// Makes `queue` the default printer of the active user.
+    pub fn set_default_printer(&self, queue: &str) {
+        let Some(agent) = self.current() else { return };
+        let queue = queue.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = agent.session().await.set_default_printer(&queue).await {
+                tracing::warn!(agent = agent.id, "default printer not set: {e}");
+            }
+        });
+    }
+
     /// Per host session state goes away with the D-Bus session or the
     /// client.
     pub fn reset(&self) {
@@ -198,6 +220,7 @@ impl Shared {
         // The agents remove theirs with the reset.
         self.cameras.lock().unwrap().clear();
         self.drives.lock().unwrap().clear();
+        self.printers.orphan_all();
         self.max_clipboard.store(-1, Ordering::Relaxed);
         self.mouse.send(mouse::Cmd::ReleaseAll);
         for agent in self.agents.lock().unwrap().iter() {
@@ -422,6 +445,9 @@ async fn clip_forwarder(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Cli
                         shared.emit_camera(*id, CameraSignal::Stream(None)).await;
                     }
                 }
+                shared
+                    .printers
+                    .user_changed(shared.clone(), new.as_ref().map(|a| a.uid));
                 if let Some(new) = &new {
                     for (id, name, formats, _, controls) in cameras {
                         if let Err(e) = new.camera().camera_add(id, &name, formats).await {
@@ -482,6 +508,8 @@ pub async fn run() -> Result<()> {
     let (shared, clip_rx) = Shared::new(mouse, logind.clone());
     tokio::spawn(clip_forwarder(shared.clone(), clip_rx));
     agents::listen(shared.clone(), &crate::ipc::socket())?;
+    shared.printers.cleanup().await;
+    printers::listen(shared.clone(), &crate::ipc::print_socket())?;
 
     let (active_tx, mut active_rx) = mpsc::unbounded_channel();
     if let Some(logind) = logind {
@@ -598,6 +626,7 @@ async fn build(split: transport::Split, shared: Arc<Shared>) -> zbus::Result<Con
         .serve_at(AGENT_PATH, FileClipboardIface(shared.clone()))?
         .serve_at(AGENT_PATH, CameraIface(shared.clone()))?
         .serve_at(AGENT_PATH, DriveIface(shared.clone()))?
+        .serve_at(AGENT_PATH, PrinterIface(shared.clone()))?
         .serve_at(AGENT_PATH, DisplayIface(shared.clone()))?
         .serve_at(AGENT_PATH, FileTransferIface(shared))?
         .build()
@@ -841,6 +870,46 @@ mod tests {
         }
     }
 
+    /// The host's printers: the jobs it got, `(printer, job, format, title,
+    /// ticket, document, ended)`.
+    type FakeJob = (u32, u32, String, String, String, Vec<u8>, bool);
+    #[derive(Clone, Default)]
+    struct FakePrinters(Arc<Mutex<Vec<FakeJob>>>);
+
+    #[zbus::interface(name = "fr.ameleo.Host.Printer1")]
+    impl FakePrinters {
+        fn begin_job(
+            &self,
+            printer_id: u32,
+            job_id: u32,
+            format: &str,
+            title: &str,
+            _user: &str,
+            ticket: &str,
+        ) {
+            self.0.lock().unwrap().push((
+                printer_id,
+                job_id,
+                format.into(),
+                title.into(),
+                ticket.into(),
+                Vec::new(),
+                false,
+            ));
+        }
+        fn write_job(&self, job_id: u32, data: Vec<u8>) {
+            let mut jobs = self.0.lock().unwrap();
+            let j = jobs.iter_mut().find(|j| j.1 == job_id).unwrap();
+            j.5.extend(data);
+        }
+        fn end_job(&self, job_id: u32) {
+            let mut jobs = self.0.lock().unwrap();
+            jobs.iter_mut().find(|j| j.1 == job_id).unwrap().6 = true;
+        }
+        fn abort_job(&self, _job_id: u32) {}
+        fn document_properties(&self, _p: u32, _r: u32, _t: &str) {}
+    }
+
     async fn host_client(shared: Arc<Shared>) -> Connection {
         let (g_out_tx, mut g_out_rx) = mpsc::channel(64);
         let (c_out_tx, mut c_out_rx) = mpsc::channel(64);
@@ -880,6 +949,8 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .unwrap()
+            .serve_at(proto::HOST_PATH, FakePrinters::default())
             .unwrap()
             .build()
             .await
@@ -1381,5 +1452,110 @@ mod tests {
         }
         assert!(!mount.exists(), "unmounted and removed");
         std::fs::remove_dir_all(&client).unwrap();
+    }
+
+    /// A job through the real CUPS backend (as CUPS runs it) to the host,
+    /// without CUPS: needs `gs` and `cargo build`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn client_printer_job() {
+        use std::io::Read;
+        let (shared, clip_rx) = Shared::new(MouseHandle::detached(), None);
+        tokio::spawn(clip_forwarder(shared.clone(), clip_rx));
+        let host = host_client(shared.clone()).await;
+        let caps = printcaps::Caps::new(printcaps::tests::CAPS, printcaps::tests::TICKET).unwrap();
+        shared.printers.insert_for_test(7, "Test_Printer", caps);
+        let dir = std::env::temp_dir().join(format!("ada-print-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("print.sock");
+        printers::listen(shared.clone(), &sock).unwrap();
+
+        let pdf = dir.join("job.pdf");
+        let ok = std::process::Command::new("gs")
+            .args(["-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite"])
+            .arg(format!("-sOutputFile={}", pdf.display()))
+            .args([
+                "-c",
+                "/Helvetica findfont 30 scalefont setfont 72 700 moveto (ameleo) show showpage",
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let out = tokio::process::Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/ameleo-display-agent"
+        ))
+        .arg("cups-backend")
+        .args([
+            "12",
+            "mike",
+            "Rapport",
+            "1",
+            "PageSize=A4 Duplex=DuplexNoTumble job-uuid=urn:x",
+        ])
+        .arg(&pdf)
+        .env("DEVICE_URI", "ameleo:/Test_Printer")
+        .env("TMPDIR", &dir)
+        .env("AMELEO_DISPLAY_AGENT_PRINT_SOCKET", &sock)
+        .output()
+        .await
+        .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        eprintln!("{err}");
+        assert!(out.status.success(), "{err}");
+
+        // What the host got.
+        let printer = host
+            .object_server()
+            .interface::<_, FakePrinters>(proto::HOST_PATH)
+            .await
+            .unwrap();
+        let jobs = printer.get().await.0.lock().unwrap().clone();
+        assert_eq!(jobs.len(), 1);
+        let (id, _, format, title, ticket, doc, ended) = &jobs[0];
+        assert_eq!(
+            (*id, format.as_str(), title.as_str(), *ended),
+            (7, "application/oxps", "Rapport", true)
+        );
+        assert!(ticket.contains("psk:ISOA4") && ticket.contains("psk:TwoSidedLongEdge"));
+        // AMELEO_PRINT_DUMP: where to keep the document, to look at it.
+        if let Ok(path) = std::env::var("AMELEO_PRINT_DUMP") {
+            std::fs::write(path, doc).unwrap();
+        }
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(doc.as_slice())).unwrap();
+        let mut pt = String::new();
+        zip.by_name("Metadata/Job_PT.xml")
+            .unwrap()
+            .read_to_string(&mut pt)
+            .unwrap();
+        assert_eq!(&pt, ticket);
+        assert!(zip.by_name("Documents/1/Pages/1.fpage").is_ok());
+        // Its temporary files are gone.
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+
+        // A queue that is not a client printer.
+        let out = tokio::process::Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/ameleo-display-agent"
+        ))
+        .arg("cups-backend")
+        .args(["13", "mike", "x", "1", ""])
+        .arg(&pdf)
+        .env("DEVICE_URI", "ameleo:/Other")
+        .env("TMPDIR", &dir)
+        .env("AMELEO_DISPLAY_AGENT_PRINT_SOCKET", &sock)
+        .output()
+        .await
+        .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("ERROR: no client printer for Other")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

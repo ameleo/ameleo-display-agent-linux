@@ -13,6 +13,8 @@ BINDIR = $(PREFIX)/bin
 LIBDIR = $(PREFIX)/lib
 DATADIR = $(PREFIX)/share
 EXTENSION = ameleo-display-agent@ameleo.fr
+# Where CUPS looks for its backends.
+CUPS_SERVERBIN ?= $(shell cups-config --serverbin 2>/dev/null || echo $(PREFIX)/lib/cups)
 
 .PHONY: all install setup deploy restart-session uninstall
 
@@ -27,6 +29,7 @@ install:
 	install -Dm644 packaging/modules-load.conf $(DESTDIR)$(LIBDIR)/modules-load.d/ameleo-display-agent.conf
 	install -Dm644 gnome-shell-extension/metadata.json $(DESTDIR)$(DATADIR)/gnome-shell/extensions/$(EXTENSION)/metadata.json
 	install -Dm644 gnome-shell-extension/extension.js $(DESTDIR)$(DATADIR)/gnome-shell/extensions/$(EXTENSION)/extension.js
+	install -Dm755 packaging/cups-backend $(DESTDIR)$(CUPS_SERVERBIN)/backend/ameleo
 
 # After install, as root: systemd and udev pick up the files, the daemon
 # starts if the agent port is there (or restarts on the new binary), and
@@ -54,3 +57,4 @@ uninstall:
 	rm -f $(DESTDIR)$(LIBDIR)/udev/rules.d/60-ameleo-display-agent.rules
 	rm -f $(DESTDIR)$(LIBDIR)/modules-load.d/ameleo-display-agent.conf
 	rm -rf $(DESTDIR)$(DATADIR)/gnome-shell/extensions/$(EXTENSION)
+	rm -f $(DESTDIR)$(CUPS_SERVERBIN)/backend/ameleo

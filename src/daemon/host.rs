@@ -52,6 +52,7 @@ impl AgentIface {
             iface::DISPLAY,
             iface::CAMERA,
             iface::DRIVE,
+            iface::PRINTER,
             iface::FILE_TRANSFER,
         ]
         .into_iter()
@@ -526,5 +527,69 @@ impl DriveIface {
         if let Some(agent) = self.0.current() {
             let _ = agent.drive().drive_changed(id, changes).await;
         }
+    }
+}
+
+pub struct PrinterIface(pub Arc<Shared>);
+
+/// Client printers: CUPS queues for the user in front of the screen
+/// ([`super::printers`]).
+#[zbus::interface(name = "fr.ameleo.Agent.Printer1")]
+impl PrinterIface {
+    /// Returns at once; the queue is made in the background.
+    fn add_printer(
+        &self,
+        id: u32,
+        name: &str,
+        is_default: bool,
+        capabilities: &str,
+        default_ticket: &str,
+    ) -> Result<()> {
+        use proto::printer::{MAX_PRINTERS, MAX_XML};
+        tracing::info!(
+            id,
+            name,
+            is_default,
+            capabilities = capabilities.len(),
+            ticket = default_ticket.len(),
+            "AddPrinter"
+        );
+        tracing::debug!(
+            id,
+            capabilities,
+            default_ticket,
+            "client printer description"
+        );
+        if capabilities.len() > MAX_XML || default_ticket.len() > MAX_XML {
+            return Err(Error::InvalidArgument(format!(
+                "XML larger than {MAX_XML} bytes"
+            )));
+        }
+        if name.trim().is_empty() || name.len() > 255 {
+            return Err(Error::InvalidArgument("bad printer name".into()));
+        }
+        if self.0.printers.count() >= MAX_PRINTERS as usize {
+            return Err(Error::Failed(format!("at most {MAX_PRINTERS} printers")));
+        }
+        self.0.printers.add(
+            self.0.clone(),
+            id,
+            name.to_string(),
+            is_default,
+            capabilities.to_string(),
+            default_ticket.to_string(),
+        );
+        Ok(())
+    }
+
+    fn remove_printer(&self, id: u32) {
+        tracing::info!(id, "RemovePrinter");
+        self.0.printers.remove(id);
+    }
+
+    /// The agent never asks for the client driver's dialog: Linux print
+    /// dialogs have no place for it.
+    fn document_properties_done(&self, request_id: u32, _print_ticket: &str, cancelled: bool) {
+        tracing::debug!(request_id, cancelled, "DocumentPropertiesDone");
     }
 }

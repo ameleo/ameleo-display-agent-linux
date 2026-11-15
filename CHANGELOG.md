@@ -23,10 +23,11 @@ Wayland session (GNOME, Plasma or wlroots) handles the user's desktop.
   the system's OpenH264 library.
 - **Client drives:** mounted with FUSE in `~/client-drives`; every file operation goes to the
   client as it happens.
+- **Client printers:** CUPS queues with the client driver's options; jobs go to the client
+  as OpenXPS, made with Ghostscript, with their PrintTicket.
 - **File transfer:** files sent from the client are saved in Downloads.
 - **Display effects:** wallpaper, font smoothing and animations can be turned off on request, on
   GNOME and Plasma, and are restored afterwards.
 
 `make deploy` installs the agent with its systemd services and a udev rule that starts the
-daemon when the agent port appears. There are no distribution packages yet. Client printers
-are not supported yet.
+daemon when the agent port appears. There are no distribution packages yet.
