@@ -506,6 +506,18 @@ impl CameraIface {
         }
     }
 
+    fn camera_controls(&self, id: u32, controls: Vec<camera::Control>) {
+        if let Some(cameras) = self.0.cameras.get() {
+            cameras.set_controls(id, controls);
+        }
+    }
+
+    fn camera_control_value(&self, id: u32, set: u8, property: u8, mode: u8, value: i32) {
+        if let Some(cameras) = self.0.cameras.get() {
+            cameras.control_value(id, set, property, mode, value);
+        }
+    }
+
     fn camera_frame(&self, id: u32, data: Vec<u8>) {
         if let Some(cameras) = self.0.cameras.get() {
             cameras.push(id, data);
@@ -689,6 +701,12 @@ pub async fn run() -> Result<()> {
                 camera::Event::KeyFrame { id } => {
                     if let Err(e) = state.daemon().camera_key_frame(id).await {
                         tracing::warn!("cannot send a camera event: {e}");
+                    }
+                }
+                camera::Event::Control { id, set, property, mode, value } => {
+                    let res = state.daemon().camera_control(id, set, property, mode, value).await;
+                    if let Err(e) = res {
+                        tracing::warn!("cannot send a camera control: {e}");
                     }
                 }
             },

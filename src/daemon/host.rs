@@ -281,6 +281,7 @@ impl CameraIface {
                     name: name.to_string(),
                     formats: formats.clone(),
                     streaming: false,
+                    controls: Vec::new(),
                 },
             );
         }
@@ -319,26 +320,47 @@ impl CameraIface {
         }
     }
 
-    /// The controls are not shown in the guest yet: taken and ignored.
-    fn set_controls(&self, id: u32, controls: Vec<proto::camera_control::Control>) -> Result<()> {
-        if !self.0.cameras.lock().unwrap().contains_key(&id) {
-            return Err(Error::InvalidArgument(format!("no camera {id}")));
-        }
+    /// Kept for the next active session, and shown in this one.
+    async fn set_controls(
+        &self,
+        id: u32,
+        controls: Vec<proto::camera_control::Control>,
+    ) -> Result<()> {
         if controls.len() > proto::camera_control::MAX_CONTROLS {
             return Err(Error::InvalidArgument(format!(
                 "at most {} controls",
                 proto::camera_control::MAX_CONTROLS
             )));
         }
-        tracing::debug!(
-            id,
-            count = controls.len(),
-            "camera controls (not shown yet)"
-        );
+        tracing::info!(id, ?controls, "SetControls");
+        match self.0.cameras.lock().unwrap().get_mut(&id) {
+            Some(cam) => cam.controls = controls.clone(),
+            None => return Err(Error::InvalidArgument(format!("no camera {id}"))),
+        }
+        if let Some(agent) = self.0.current() {
+            let _ = agent.camera().camera_controls(id, controls).await;
+        }
         Ok(())
     }
 
-    fn control_value(&self, _id: u32, _set: u8, _property: u8, _mode: u8, _value: i32) {}
+    async fn control_value(&self, id: u32, set: u8, property: u8, mode: u8, value: i32) {
+        tracing::info!(id, set, property, mode, value, "ControlValue");
+        let known = match self.0.cameras.lock().unwrap().get_mut(&id) {
+            Some(cam) => cam
+                .controls
+                .iter_mut()
+                .find(|c| c.0 == set && c.1 == property)
+                .map(|c| (c.7, c.8) = (mode, value))
+                .is_some(),
+            None => false,
+        };
+        if known && let Some(agent) = self.0.current() {
+            let _ = agent
+                .camera()
+                .camera_control_value(id, set, property, mode, value)
+                .await;
+        }
+    }
 
     #[zbus(signal)]
     pub async fn stream_requested(

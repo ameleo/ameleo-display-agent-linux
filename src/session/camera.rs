@@ -54,6 +54,15 @@ pub enum Event {
     Stream { id: u32, format: Option<u32> },
     /// The decoder needs an IDR.
     KeyFrame { id: u32 },
+    /// An app changed a control: MS-RDPECAM numbers, see
+    /// `proto::camera_control`.
+    Control {
+        id: u32,
+        set: u8,
+        property: u8,
+        mode: u8,
+        value: i32,
+    },
 }
 
 /// To the PipeWire thread.
@@ -68,6 +77,19 @@ enum Pw {
         id: u32,
     },
     RemoveAll,
+    /// The client's controls of camera `id`, replacing the previous ones.
+    Controls {
+        id: u32,
+        controls: Vec<Control>,
+    },
+    /// What a control is now.
+    ControlValue {
+        id: u32,
+        set: u8,
+        property: u8,
+        mode: u8,
+        value: i32,
+    },
     /// A decoded picture, I420, packed.
     Picture {
         id: u32,
@@ -166,6 +188,20 @@ impl Cameras {
 
     pub fn remove_all(&self) {
         let _ = self.pw.send(Pw::RemoveAll);
+    }
+
+    pub fn set_controls(&self, id: u32, controls: Vec<Control>) {
+        let _ = self.pw.send(Pw::Controls { id, controls });
+    }
+
+    pub fn control_value(&self, id: u32, set: u8, property: u8, mode: u8, value: i32) {
+        let _ = self.pw.send(Pw::ControlValue {
+            id,
+            set,
+            property,
+            mode,
+            value,
+        });
     }
 
     /// Never blocks: a full queue drops the frame.
@@ -413,6 +449,8 @@ struct CamState {
     last_log: Option<Instant>,
     /// The last picture, waiting for the next `process`.
     picture: Option<(u32, u32, Vec<u8>)>,
+    /// The client's controls, with their current mode and value.
+    controls: Vec<Control>,
 }
 
 impl CamState {
@@ -508,6 +546,41 @@ fn pw_thread(
                     let _ = dec.send(Dec::Remove {
                         id: cam.state.borrow().id,
                     });
+                }
+            }
+            Pw::Controls { id, controls } => {
+                let cams = cams.borrow();
+                let Some(cam) = cams.get(&id) else { return };
+                tracing::info!(id, count = controls.len(), "camera controls");
+                cam.state.borrow_mut().controls = controls;
+                publish_controls(cam);
+            }
+            Pw::ControlValue {
+                id,
+                set,
+                property,
+                mode,
+                value,
+            } => {
+                let cams = cams.borrow();
+                let Some(cam) = cams.get(&id) else { return };
+                let changed = {
+                    let mut st = cam.state.borrow_mut();
+                    match st
+                        .controls
+                        .iter_mut()
+                        .find(|c| c.0 == set && c.1 == property)
+                    {
+                        Some(c) if (c.7, c.8) != (mode, value) => {
+                            (c.7, c.8) = (mode, value);
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                tracing::debug!(id, set, property, mode, value, "camera control value");
+                if changed {
+                    publish_controls(cam);
                 }
             }
             Pw::Picture {
@@ -667,6 +740,181 @@ fn monotonic_ns() -> i64 {
         .saturating_add(t.tv_nsec)
 }
 
+pub use proto::camera_control::Control;
+
+/// The node property of a control's value and of its automatic mode, and
+/// their names: V4L2's controls where they match (PipeWire's own ids for
+/// the common ones, `SPA_PROP_START_CUSTOM` + the V4L2 id for the others,
+/// as PipeWire's V4L2 cameras have them), so that `pw-v4l2` gives them to
+/// V4L2 apps. The rest get ids in V4L2's private range.
+fn control_props(set: u8, property: u8) -> (u32, u32, String, String) {
+    use proto::camera_control as cc;
+    use spa::sys::{
+        SPA_PROP_START_CUSTOM, SPA_PROP_brightness, SPA_PROP_contrast, SPA_PROP_exposure,
+        SPA_PROP_hue,
+    };
+    let v4l2 = |cid: u32| SPA_PROP_START_CUSTOM + cid;
+    let private =
+        |auto: u32| v4l2(0x0800_0000 + ((u32::from(set) << 8 | u32::from(property)) << 1 | auto));
+    let (value, auto, name): (u32, Option<u32>, &str) = match (set, property) {
+        (cc::VIDEO_PROC_AMP, cc::BRIGHTNESS) => {
+            (SPA_PROP_brightness, Some(v4l2(0x0098_0920)), "Brightness")
+        }
+        (cc::VIDEO_PROC_AMP, cc::CONTRAST) => (SPA_PROP_contrast, None, "Contrast"),
+        (cc::VIDEO_PROC_AMP, cc::HUE) => (SPA_PROP_hue, Some(v4l2(0x0098_0919)), "Hue"),
+        (cc::VIDEO_PROC_AMP, cc::WHITE_BALANCE) => (
+            v4l2(0x0098_091a),
+            Some(v4l2(0x0098_090c)),
+            "White Balance Temperature",
+        ),
+        (cc::VIDEO_PROC_AMP, cc::BACKLIGHT_COMPENSATION) => {
+            (v4l2(0x0098_091c), None, "Backlight Compensation")
+        }
+        (cc::CAMERA_CONTROL, cc::EXPOSURE) => (SPA_PROP_exposure, None, "Exposure"),
+        (cc::CAMERA_CONTROL, cc::FOCUS) => (v4l2(0x009a_090a), Some(v4l2(0x009a_090c)), "Focus"),
+        (cc::CAMERA_CONTROL, cc::PAN) => (v4l2(0x009a_0908), None, "Pan"),
+        (cc::CAMERA_CONTROL, cc::TILT) => (v4l2(0x009a_0909), None, "Tilt"),
+        (cc::CAMERA_CONTROL, cc::ZOOM) => (v4l2(0x009a_090d), None, "Zoom"),
+        (cc::CAMERA_CONTROL, cc::ROLL) => (private(0), None, "Roll"),
+        _ => (private(0), None, ""),
+    };
+    let name = if name.is_empty() {
+        format!("Control {set}.{property}")
+    } else {
+        name.to_string()
+    };
+    let auto_name = format!("{name}, Automatic");
+    (value, auto.unwrap_or_else(|| private(1)), name, auto_name)
+}
+
+/// What the node offers of the controls: a `PropInfo` per value and per
+/// automatic mode, then the current values (`Props`).
+fn control_params(controls: &[Control]) -> Vec<Vec<u8>> {
+    use proto::camera_control::{AUTO, MANUAL};
+    use spa::pod::{ChoiceValue, Object, Property, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id, SpaTypes};
+    let info = |id: u32, name: &str, type_: ChoiceValue| {
+        serialize(Object {
+            type_: SpaTypes::ObjectParamPropInfo.as_raw(),
+            id: spa::param::ParamType::PropInfo.as_raw(),
+            properties: vec![
+                Property::new(spa::sys::SPA_PROP_INFO_id, Value::Id(Id(id))),
+                Property::new(
+                    spa::sys::SPA_PROP_INFO_description,
+                    Value::String(name.into()),
+                ),
+                Property::new(spa::sys::SPA_PROP_INFO_type, Value::Choice(type_)),
+            ],
+        })
+    };
+    let mut params = Vec::new();
+    let mut values = Vec::new();
+    for &(set, property, caps, min, max, step, default, mode, value) in controls {
+        let (value_id, auto_id, name, auto_name) = control_props(set, property);
+        if caps & MANUAL != 0 {
+            params.push(info(
+                value_id,
+                &name,
+                ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Step {
+                        default: default.clamp(min.min(max), max.max(min)),
+                        min: min.min(max),
+                        max: max.max(min),
+                        step: step.max(1),
+                    },
+                )),
+            ));
+            // In automatic mode, some clients give a value outside the
+            // range (0 for the white balance): shown within it.
+            values.push(Property::new(
+                value_id,
+                Value::Int(value.clamp(min.min(max), max.max(min))),
+            ));
+        }
+        if caps & AUTO != 0 {
+            let def = caps & MANUAL == 0;
+            params.push(info(
+                auto_id,
+                &auto_name,
+                ChoiceValue::Bool(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Enum {
+                        default: def,
+                        alternatives: vec![false, true],
+                    },
+                )),
+            ));
+            values.push(Property::new(auto_id, Value::Bool(mode & AUTO != 0)));
+        }
+    }
+    if !values.is_empty() {
+        params.push(serialize(Object {
+            type_: SpaTypes::ObjectParamProps.as_raw(),
+            id: spa::param::ParamType::Props.as_raw(),
+            properties: values,
+        }));
+    }
+    params
+}
+
+/// The controls an app's `Props` asks to change: `(set, property, mode,
+/// value)`.
+fn requested(controls: &[Control], props: &[u8]) -> Vec<(u8, u8, u8, i32)> {
+    use proto::camera_control::{AUTO, MANUAL};
+    use spa::pod::Value;
+    let Ok((_, Value::Object(obj))) =
+        spa::pod::deserialize::PodDeserializer::deserialize_any_from(props)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for prop in obj.properties {
+        let number = match prop.value {
+            Value::Int(v) => Some(v),
+            Value::Long(v) => Some(v as i32),
+            Value::Float(v) => Some(v.round() as i32),
+            Value::Double(v) => Some(v.round() as i32),
+            Value::Bool(v) => Some(v as i32),
+            _ => None,
+        };
+        let Some(number) = number else { continue };
+        for &(set, property, caps, min, max, _, _, mode, value) in controls {
+            let (value_id, auto_id, _, _) = control_props(set, property);
+            if prop.key == value_id && caps & MANUAL != 0 {
+                out.push((
+                    set,
+                    property,
+                    MANUAL,
+                    number.clamp(min.min(max), max.max(min)),
+                ));
+            } else if prop.key == auto_id && caps & AUTO != 0 {
+                let auto = number != 0;
+                if auto != (mode & AUTO != 0) {
+                    out.push((set, property, if auto { AUTO } else { MANUAL }, value));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Gives the node's controls to PipeWire.
+fn publish_controls(cam: &Cam) {
+    let params = control_params(&cam.state.borrow().controls);
+    let mut pods: Vec<&spa::pod::Pod> = params
+        .iter()
+        .filter_map(|b| spa::pod::Pod::from_bytes(b))
+        .collect();
+    if pods.is_empty() {
+        return;
+    }
+    // May call back: the state is not borrowed.
+    if let Err(e) = cam.stream.update_params(&mut pods) {
+        tracing::warn!("cannot give the camera controls to PipeWire: {e}");
+    }
+}
+
 fn create(
     core: &pw::core::CoreRc,
     id: u32,
@@ -702,13 +950,41 @@ fn create(
         held: 0,
         last_log: None,
         picture: None,
+        controls: Vec::new(),
     }));
     let listener = {
         let (s1, s2, s3, s4) = (state.clone(), state.clone(), state.clone(), state.clone());
         let events2 = events.clone();
+        let events3 = events.clone();
         stream
             .add_local_listener_with_user_data(())
             .param_changed(move |stream, _, pid, param| {
+                if pid == spa::param::ParamType::Props.as_raw() {
+                    // An app sets controls: asked of the client, shown
+                    // when it answers (`ControlValue`).
+                    let st = s1.borrow();
+                    for (set, property, mode, value) in param
+                        .map(|p| requested(&st.controls, p.as_bytes()))
+                        .unwrap_or_default()
+                    {
+                        tracing::info!(
+                            id = st.id,
+                            set,
+                            property,
+                            mode,
+                            value,
+                            "camera control asked"
+                        );
+                        let _ = events3.send(Event::Control {
+                            id: st.id,
+                            set,
+                            property,
+                            mode,
+                            value,
+                        });
+                    }
+                    return;
+                }
                 if pid != spa::param::ParamType::Format.as_raw() {
                     return;
                 }
@@ -944,6 +1220,61 @@ mod tests {
     }
 
     #[test]
+    fn controls_to_props_and_back() {
+        use proto::camera_control::*;
+        let controls: Vec<Control> = vec![
+            // Brightness: manual, at 10 of -64..64.
+            (
+                VIDEO_PROC_AMP,
+                BRIGHTNESS,
+                MANUAL,
+                -64,
+                64,
+                1,
+                0,
+                MANUAL,
+                10,
+            ),
+            // Focus: manual or auto, auto now.
+            (CAMERA_CONTROL, FOCUS, MANUAL | AUTO, 0, 250, 5, 0, AUTO, 30),
+        ];
+        let params = control_params(&controls);
+        // Two values, one auto, the Props.
+        assert_eq!(params.len(), 4);
+        assert!(
+            params
+                .iter()
+                .all(|p| spa::pod::Pod::from_bytes(p).is_some())
+        );
+        let (focus, focus_auto, name, auto_name) = control_props(CAMERA_CONTROL, FOCUS);
+        assert_eq!(focus, spa::sys::SPA_PROP_START_CUSTOM + 0x009a_090a);
+        assert_eq!(
+            (name.as_str(), auto_name.as_str()),
+            ("Focus", "Focus, Automatic")
+        );
+        let props = serialize(spa::pod::Object {
+            type_: spa::utils::SpaTypes::ObjectParamProps.as_raw(),
+            id: spa::param::ParamType::Props.as_raw(),
+            properties: vec![
+                spa::pod::Property::new(spa::sys::SPA_PROP_brightness, spa::pod::Value::Int(99)),
+                spa::pod::Property::new(focus_auto, spa::pod::Value::Bool(false)),
+                spa::pod::Property::new(focus, spa::pod::Value::Float(120.0)),
+            ],
+        });
+        assert_eq!(
+            requested(&controls, &props),
+            [
+                (VIDEO_PROC_AMP, BRIGHTNESS, MANUAL, 64),
+                (CAMERA_CONTROL, FOCUS, MANUAL, 30),
+                (CAMERA_CONTROL, FOCUS, MANUAL, 120),
+            ]
+        );
+        // Unknown controls still get distinct ids.
+        assert_ne!(control_props(9, 1).0, control_props(9, 2).0);
+        assert_ne!(control_props(9, 1).0, control_props(9, 1).1);
+    }
+
+    #[test]
     fn pods_serialize() {
         assert!(spa::pod::Pod::from_bytes(&enum_format(&(640, 480, 30, 1))).is_some());
         assert!(spa::pod::Pod::from_bytes(&buffers(640, 480)).is_some());
@@ -976,6 +1307,96 @@ mod tests {
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("ameleo-camera-42"), "{text}");
         cams.remove(42);
+    }
+
+    /// The controls of a camera, as an app sees and sets them through
+    /// PipeWire (`pw-cli` here): needs a running PipeWire and libopenh264.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn camera_controls() {
+        use proto::camera_control::*;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cams = Cameras::spawn(tx).unwrap();
+        cams.add(43, "ameleo control camera".into(), vec![(640, 480, 30, 1)])
+            .await
+            .unwrap();
+        cams.set_controls(
+            43,
+            vec![
+                (
+                    VIDEO_PROC_AMP,
+                    BRIGHTNESS,
+                    MANUAL,
+                    -64,
+                    64,
+                    1,
+                    0,
+                    MANUAL,
+                    10,
+                ),
+                (CAMERA_CONTROL, FOCUS, MANUAL | AUTO, 0, 250, 5, 0, AUTO, 30),
+            ],
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let pw_cli = |args: Vec<String>| async move {
+            let out = tokio::process::Command::new("pw-cli")
+                .args(&args)
+                .output()
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let nodes = pw_cli(vec!["ls".into(), "Node".into()]).await;
+        let id = nodes
+            .split("\tid ")
+            .find(|n| n.contains("ameleo-camera-43"))
+            .and_then(|n| n.split(',').next())
+            .expect("camera node")
+            .trim()
+            .to_string();
+        let info = pw_cli(vec!["enum-params".into(), id.clone(), "PropInfo".into()]).await;
+        eprintln!("{info}");
+        for name in ["Brightness", "Focus", "Focus, Automatic"] {
+            assert!(info.contains(&format!("\"{name}\"")), "{name} missing");
+        }
+        // An app turns autofocus off and sets the brightness.
+        let focus_auto = control_props(CAMERA_CONTROL, FOCUS).1;
+        pw_cli(vec![
+            "set-param".into(),
+            id.clone(),
+            "Props".into(),
+            format!("{{ brightness: 20, {focus_auto}: false }}"),
+        ])
+        .await;
+        let mut asked = Vec::new();
+        while asked.len() < 2 {
+            match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+                Ok(Some(Event::Control {
+                    set,
+                    property,
+                    mode,
+                    value,
+                    ..
+                })) => asked.push((set, property, mode, value)),
+                Ok(Some(_)) => {}
+                _ => panic!("control requests: {asked:?}"),
+            }
+        }
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                (CAMERA_CONTROL, FOCUS, MANUAL, 30),
+                (VIDEO_PROC_AMP, BRIGHTNESS, MANUAL, 20)
+            ]
+        );
+        // The client took it: the node shows it.
+        cams.control_value(43, VIDEO_PROC_AMP, BRIGHTNESS, MANUAL, 20);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let props = pw_cli(vec!["enum-params".into(), id, "Props".into()]).await;
+        eprintln!("{props}");
+        assert!(props.contains("Int 20"), "{props}");
+        cams.remove(43);
     }
 
     /// Replays a dumped H.264 stream (`AMELEO_REPLAY=<file>`, 1080p30)

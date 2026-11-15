@@ -216,8 +216,12 @@ PipeWire or the camera portal list it, such as Firefox, Chromium, OBS and GNOME 
 * **Apps that use V4L2 directly.** Apps that open `/dev/video*` themselves do not see PipeWire
   cameras. PipeWire's `pw-v4l2` wrapper gives them the PipeWire cameras:
   `pw-v4l2 <app>`.
-* **Controls.** The agent accepts `SetControls` and `ControlValue`, but does not show the camera
-  controls in the guest yet.
+* **Controls.** The client's controls (`SetControls`) become properties of the node, as
+  PipeWire's own V4L2 cameras have them: brightness, contrast, hue, exposure, white balance,
+  focus, pan, tilt, zoom..., each with an automatic mode switch when the client has one. Apps that
+  set camera properties through PipeWire, such as OBS, show them, and `pw-v4l2` gives them to
+  V4L2 apps. When an app changes one, the agent sends `ControlRequested`; the node shows the new
+  value when the host answers with `ControlValue`.
 
 ### Drives
 
@@ -284,7 +288,6 @@ setting.
 ## Not supported yet
 
 * Client printers. The agent does not list them in `Agent1.Channels`.
-* Camera controls (brightness, focus, zoom...) in the guest.
 * X11 sessions, and the clipboard on the login screen.
 * Distribution packages (RPM and deb).
 

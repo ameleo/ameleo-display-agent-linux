@@ -83,6 +83,8 @@ pub struct CameraInfo {
     pub formats: Vec<(u32, u32, u32, u32)>,
     /// An app of the active session uses it.
     pub streaming: bool,
+    /// Its controls, with their current values.
+    pub controls: Vec<proto::camera_control::Control>,
 }
 
 /// A client drive, kept to be mounted in the next active session.
@@ -96,6 +98,8 @@ pub enum CameraSignal {
     /// `StreamRequested(format)`, or `StreamStopped`.
     Stream(Option<u32>),
     KeyFrame,
+    /// `ControlRequested(set, property, mode, value)`.
+    Control(u8, u8, u8, i32),
 }
 
 /// Clipboard requests to the active session agent, in the host's order.
@@ -306,6 +310,17 @@ impl Shared {
                 CameraIface::stream_stopped(e, id).await
             }
             CameraSignal::KeyFrame => CameraIface::key_frame_needed(e, id).await,
+            CameraSignal::Control(set, property, mode, value) => {
+                tracing::info!(
+                    id,
+                    set,
+                    property,
+                    mode,
+                    value,
+                    "signal ControlRequested sent to the host"
+                );
+                CameraIface::control_requested(e, id, set, property, mode, value).await
+            }
         };
         if let Err(err) = res {
             tracing::warn!(id, "cannot send the camera signal: {err}");
@@ -392,19 +407,27 @@ async fn clip_forwarder(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Cli
                     cams.iter_mut()
                         .map(|(&id, c)| {
                             let was = std::mem::take(&mut c.streaming);
-                            (id, c.name.clone(), c.formats.clone(), was)
+                            (
+                                id,
+                                c.name.clone(),
+                                c.formats.clone(),
+                                was,
+                                c.controls.clone(),
+                            )
                         })
                         .collect()
                 };
-                for (id, _, _, was) in &cameras {
+                for (id, _, _, was, _) in &cameras {
                     if *was {
                         shared.emit_camera(*id, CameraSignal::Stream(None)).await;
                     }
                 }
                 if let Some(new) = &new {
-                    for (id, name, formats, _) in cameras {
+                    for (id, name, formats, _, controls) in cameras {
                         if let Err(e) = new.camera().camera_add(id, &name, formats).await {
                             tracing::warn!(id, agent = new.id, "camera not added: {e}");
+                        } else if !controls.is_empty() {
+                            let _ = new.camera().camera_controls(id, controls).await;
                         }
                     }
                     // The drives too, for the new user only.

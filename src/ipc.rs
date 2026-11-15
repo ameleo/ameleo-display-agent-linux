@@ -113,6 +113,15 @@ pub trait Daemon {
     fn camera_stream(&self, id: u32, format: i32) -> zbus::Result<()>;
     /// The decoder of camera `id` needs an IDR.
     fn camera_key_frame(&self, id: u32) -> zbus::Result<()>;
+    /// An app changed a control of camera `id` (`ControlRequested`).
+    fn camera_control(
+        &self,
+        id: u32,
+        set: u8,
+        property: u8,
+        mode: u8,
+        value: i32,
+    ) -> zbus::Result<()>;
     /// A guest app pastes host data: `Host.Clipboard1.Request`.
     fn host_clipboard_request(
         &self,
@@ -139,6 +148,21 @@ pub trait SessionCamera {
     ) -> zbus::Result<()>;
     fn camera_remove(&self, id: u32) -> zbus::Result<()>;
     fn camera_remove_all(&self) -> zbus::Result<()>;
+    /// The client's controls, see `proto::Camera::set_controls`.
+    fn camera_controls(
+        &self,
+        id: u32,
+        controls: Vec<proto::camera_control::Control>,
+    ) -> zbus::Result<()>;
+    /// What a control is now (`ControlValue`).
+    fn camera_control_value(
+        &self,
+        id: u32,
+        set: u8,
+        property: u8,
+        mode: u8,
+        value: i32,
+    ) -> zbus::Result<()>;
     /// One H.264 access unit.
     #[zbus(no_reply)]
     fn camera_frame(&self, id: u32, data: Vec<u8>) -> zbus::Result<()>;

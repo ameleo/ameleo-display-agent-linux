@@ -18,8 +18,9 @@ Wayland session (GNOME, Plasma or wlroots) handles the user's desktop.
   through the agent's GNOME Shell extension.
 - **File clipboard:** files and folders in both directions, in the MS-RDPECLIP format. Host
   files are read on demand through a FUSE file system, so nothing is copied in advance.
-- **Client cameras:** shown as PipeWire cameras of the user's session; the agent decodes the
-  H.264 stream in the guest with the system's OpenH264 library.
+- **Client cameras:** shown as PipeWire cameras of the user's session, with the client's
+  controls (brightness, focus, zoom...); the agent decodes the H.264 stream in the guest with
+  the system's OpenH264 library.
 - **Client drives:** mounted with FUSE in `~/client-drives`; every file operation goes to the
   client as it happens.
 - **File transfer:** files sent from the client are saved in Downloads.
@@ -28,4 +29,4 @@ Wayland session (GNOME, Plasma or wlroots) handles the user's desktop.
 
 `make deploy` installs the agent with its systemd services and a udev rule that starts the
 daemon when the agent port appears. There are no distribution packages yet. Client printers
-and camera controls are not supported yet.
+are not supported yet.

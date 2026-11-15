@@ -264,6 +264,14 @@ impl DaemonIface {
             .await;
     }
 
+    async fn camera_control(&self, id: u32, set: u8, property: u8, mode: u8, value: i32) {
+        if self.is_current() {
+            self.shared
+                .emit_camera(id, CameraSignal::Control(set, property, mode, value))
+                .await;
+        }
+    }
+
     async fn camera_key_frame(&self, id: u32) {
         if self.is_current() {
             self.shared.emit_camera(id, CameraSignal::KeyFrame).await;
