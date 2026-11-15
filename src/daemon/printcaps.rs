@@ -73,6 +73,38 @@ pub struct Caps {
     pub features: Vec<Feature>,
     /// The default ticket, as the host gave it.
     pub ticket: String,
+    /// The printer's margins, in points: left, top, right, bottom.
+    pub margins: [f64; 4],
+}
+
+/// Margins when the driver tells none: 12 pt (4.2 mm), what most
+/// printers need.
+const DEFAULT_MARGIN: f64 = 12.0;
+
+/// The integer value of the property `local` (any prefix), in `xml`.
+fn number(xml: &str, local: &str) -> Option<i64> {
+    let at = xml.find(&format!(":{local}\""))?;
+    let rest = &xml[at..];
+    let start = rest.find("Value")?;
+    let rest = &rest[start..];
+    let open = rest.find('>')? + 1;
+    let close = rest[open..].find('<')? + open;
+    rest[open..close].trim().parse().ok()
+}
+
+/// The margins of the driver's `psk:PageImageableSize`, which it gives for
+/// its default paper: left, top, right, bottom, in points.
+fn margins(caps: &str) -> Option<[f64; 4]> {
+    let at = caps.find(":PageImageableSize\"")?;
+    let xml = &caps[at..];
+    let (w, h) = (
+        number(xml, "ImageableSizeWidth")?,
+        number(xml, "ImageableSizeHeight")?,
+    );
+    let (ox, oy) = (number(xml, "OriginWidth")?, number(xml, "OriginHeight")?);
+    let (ex, ey) = (number(xml, "ExtentWidth")?, number(xml, "ExtentHeight")?);
+    let pt = |um: i64| (um as f64 / 25_400.0 * 72.0).clamp(0.0, 72.0);
+    Some([pt(ox), pt(oy), pt(w - ox - ex), pt(h - oy - ey)])
 }
 
 /// Namespace scopes while reading.
@@ -415,6 +447,7 @@ impl Caps {
     pub fn new(capabilities: &str, default_ticket: &str) -> Result<Self, String> {
         let mut caps = Caps {
             ticket: default_ticket.to_string(),
+            margins: margins(capabilities).unwrap_or([DEFAULT_MARGIN; 4]),
             ..Default::default()
         };
         if capabilities.trim().is_empty() {
@@ -590,9 +623,13 @@ impl Caps {
                 line(format!("*DefaultPaperDimension: {pick}"));
                 for o in &f.options {
                     let (w, h) = o.size.map_or((0.0, 0.0), |(w, h)| (size(w), size(h)));
+                    // `llx lly urx ury`, from the bottom left corner.
+                    let [l, t, r, b] = self.margins;
                     line(format!(
-                        "*ImageableArea {}: \"0 0 {w:.2} {h:.2}\"",
-                        o.keyword
+                        "*ImageableArea {}: \"{l:.2} {b:.2} {:.2} {:.2}\"",
+                        o.keyword,
+                        (w - r).max(l),
+                        (h - t).max(b)
                     ));
                     line(format!("*PaperDimension {}: \"{w:.2} {h:.2}\"", o.keyword));
                 }
@@ -610,8 +647,14 @@ impl Caps {
             line("*PageRegion Letter/Letter: \"\"".into());
             line("*CloseUI: *PageRegion".into());
             line("*DefaultImageableArea: A4".into());
-            line("*ImageableArea A4: \"0 0 595.28 841.89\"".into());
-            line("*ImageableArea Letter: \"0 0 612 792\"".into());
+            let [l, t, r, b] = self.margins;
+            for (k, w, h) in [("A4", 595.28, 841.89), ("Letter", 612.0, 792.0)] {
+                line(format!(
+                    "*ImageableArea {k}: \"{l:.2} {b:.2} {:.2} {:.2}\"",
+                    w - r,
+                    h - t
+                ));
+            }
             line("*DefaultPaperDimension: A4".into());
             line("*PaperDimension A4: \"595.28 841.89\"".into());
             line("*PaperDimension Letter: \"612 792\"".into());
@@ -858,6 +901,16 @@ pub(crate) mod tests {
   <psf:Feature name="psk:DocumentPageRanges">
     <psf:Option name="psk:AllPages"/><psf:Option name="psk:OddPages"/>
   </psf:Feature>
+  <psf:Property name="psk:PageImageableSize">
+    <psf:Property name="psk:ImageableSizeWidth"><psf:Value xsi:type="xsd:integer">215900</psf:Value></psf:Property>
+    <psf:Property name="psk:ImageableSizeHeight"><psf:Value xsi:type="xsd:integer">279400</psf:Value></psf:Property>
+    <psf:Property name="psk:ImageableArea">
+      <psf:Property name="psk:OriginWidth"><psf:Value xsi:type="xsd:integer">6350</psf:Value></psf:Property>
+      <psf:Property name="psk:OriginHeight"><psf:Value xsi:type="xsd:integer">4233</psf:Value></psf:Property>
+      <psf:Property name="psk:ExtentWidth"><psf:Value xsi:type="xsd:integer">203200</psf:Value></psf:Property>
+      <psf:Property name="psk:ExtentHeight"><psf:Value xsi:type="xsd:integer">270934</psf:Value></psf:Property>
+    </psf:Property>
+  </psf:Property>
   <psf:ParameterDef name="psk:JobCopiesAllDocuments"/>
 </psf:PrintCapabilities>"#;
 
@@ -898,6 +951,11 @@ pub(crate) mod tests {
         let text: String = ppd.iter().map(|&b| b as char).collect();
         assert!(text.contains("*DefaultPageSize: Letter\n"));
         assert!(text.contains("*PaperDimension A4: \"595.28 841.89\"\n"));
+        // The driver's margins: 6.35 mm left and right, 4.233 mm top and bottom.
+        assert!(
+            text.contains("*ImageableArea A4: \"18.00 12.00 577.28 829.89\"\n"),
+            "{text}"
+        );
         assert!(text.contains("*Duplex DuplexNoTumble/Recto verso: \"\"\n"));
         assert!(text.contains("*OpenUI *EconoMode/Mode économique: PickOne\n"));
         assert!(text.contains("*ModelName: \"HP LaserJet  bureau\"\n"));
@@ -950,6 +1008,7 @@ pub(crate) mod tests {
         let caps = Caps::new("", "").unwrap();
         let text: String = caps.ppd("P").iter().map(|&b| b as char).collect();
         assert!(text.contains("*DefaultPageSize: A4"));
+        assert!(text.contains("*ImageableArea A4: \"12.00 12.00 583.28 829.89\"\n"));
         let t = caps.ticket(&job_options("landscape"));
         assert!(t.contains("psk:Landscape"));
         assert!(parse(&t).is_ok());

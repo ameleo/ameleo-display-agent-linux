@@ -262,17 +262,19 @@ client's name as its description), so every print dialog lists it.
   ones use CUPS's names (`PageSize`, `Duplex`, `ColorModel`, `InputSlot`...), so the dialogs
   show them in their usual places. CUPS itself makes the copies, n-up and page ranges.
 * **Jobs.** CUPS gives each job as PDF to the agent's `ameleo` backend, which it runs as `lp`.
-  The backend makes an XPS document of it with Ghostscript (`xpswrite`) and hands it to the
-  daemon over `/run/ameleo-display-agent/print.sock`, which only root and `lp` may use. The
-  daemon moves the document to OpenXPS, the format Windows makes and the host expects, and
-  writes the job's PrintTicket into it (`Metadata/Job_PT.xml`): the client's
-  default ticket, with the options chosen in the dialog put in. The driver's other settings,
-  its `PageDevmodeSnapshot` among them, stay as they are. The document goes to the host in
-  256 KiB chunks (`BeginJob`, `WriteJob`, `EndJob`).
+  The backend makes an XPS document of it with Ghostscript, in two passes since `xpswrite`
+  cannot write fonts: the text first becomes vector outlines (`pdfwrite` with `NoOutputFonts`),
+  then `xpswrite` makes the document. The backend hands it to the daemon over
+  `/run/ameleo-display-agent/print.sock`, which only root and `lp` may use. The daemon moves the
+  document to OpenXPS, the format Windows makes and the host expects, and writes the job's
+  PrintTicket into it (`Metadata/Job_PT.xml`): the client's default ticket, with the options
+  chosen in the dialog put in. The driver's other settings, its `PageDevmodeSnapshot` among
+  them, stay as they are. The document goes to the host in 256 KiB chunks (`BeginJob`,
+  `WriteJob`, `EndJob`).
 * **One user.** Only the user in front of the screen may print to the queues
   (`lpadmin -u allow:`); they follow that user. The client's default printer becomes that
   user's default (`lpoptions -d`).
-* **Sessions.** When the host session ends, the queues are disabled for 60 seconds: a printer
+* **Sessions.** When the host session ends, no one may print for 60 seconds: a printer
   of the same name in the next session takes its queue over, and the others are deleted.
   `RemovePrinter` deletes the queue at once, and the daemon deletes queues that a previous
   daemon left when it starts.

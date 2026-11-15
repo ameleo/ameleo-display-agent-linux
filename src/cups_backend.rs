@@ -78,10 +78,12 @@ async fn print(args: &[String]) -> Result<(), String> {
             p
         }
     };
+    let outlines = base.with_extension("outlines.pdf");
     let xps = base.with_extension("xps");
+    temp.0.push(outlines.clone());
     temp.0.push(xps.clone());
     eprintln!("INFO: Converting the document");
-    to_xps(&pdf, &xps).await?;
+    to_xps(&pdf, &outlines, &xps).await?;
 
     eprintln!("INFO: Sending the document to the client");
     let stream = tokio::net::UnixStream::connect(crate::ipc::print_socket())
@@ -110,19 +112,22 @@ async fn print(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// PDF to XPS, with Ghostscript.
-async fn to_xps(pdf: &Path, xps: &Path) -> Result<(), String> {
+/// PDF to XPS, with Ghostscript, in two passes. `xpswrite` cannot write
+/// fonts: it draws the text of embedded fonts as small rectangles at
+/// 96 dpi. So the text first becomes outlines (`pdfwrite` with
+/// `NoOutputFonts`), which `xpswrite` writes as vector paths.
+async fn to_xps(pdf: &Path, outlines: &Path, xps: &Path) -> Result<(), String> {
+    gs("pdfwrite", &["-dNoOutputFonts"], pdf, outlines).await?;
+    gs("xpswrite", &[], outlines, xps).await
+}
+
+async fn gs(device: &str, extra: &[&str], input: &Path, output: &Path) -> Result<(), String> {
     let out = tokio::process::Command::new("gs")
-        .args([
-            "-q",
-            "-dSAFER",
-            "-dBATCH",
-            "-dNOPAUSE",
-            "-dNOINTERPOLATE",
-            "-sDEVICE=xpswrite",
-        ])
-        .arg(format!("-sOutputFile={}", xps.display()))
-        .arg(pdf)
+        .args(["-q", "-dSAFER", "-dBATCH", "-dNOPAUSE"])
+        .arg(format!("-sDEVICE={device}"))
+        .args(extra)
+        .arg(format!("-sOutputFile={}", output.display()))
+        .arg(input)
         .output()
         .await
         .map_err(|e| format!("Ghostscript (gs): {e}"))?;

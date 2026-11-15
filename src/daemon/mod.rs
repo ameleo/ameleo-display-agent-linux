@@ -689,12 +689,12 @@ mod tests {
     #[derive(Default)]
     struct FakeDrive {
         root: std::path::PathBuf,
-        /// Open files: path, file (not for folders), delete on close.
         files: std::sync::Mutex<HashMap<u32, FakeOpen>>,
         next: AtomicU32,
     }
 
-    type FakeOpen = (std::path::PathBuf, Option<std::fs::File>, bool);
+    /// Path, file (not for folders), attributes readable, delete on close.
+    type FakeOpen = (std::path::PathBuf, Option<std::fs::File>, bool, bool);
 
     const NOT_FOUND: u32 = 0xC000_0034;
     const COLLISION: u32 = 0xC000_0035;
@@ -762,12 +762,15 @@ mod tests {
                     .unwrap()
             });
             let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-            self.files.lock().unwrap().insert(id, (full, file, false));
+            self.files
+                .lock()
+                .unwrap()
+                .insert(id, (full, file, access & 0x80 != 0, false));
             (0, id, information)
         }
 
         fn close(&self, _drive_id: u32, file_id: u32) -> u32 {
-            if let Some((path, _, true)) = self.files.lock().unwrap().remove(&file_id) {
+            if let Some((path, _, _, true)) = self.files.lock().unwrap().remove(&file_id) {
                 if path.is_dir() {
                     std::fs::remove_dir(path).unwrap();
                 } else {
@@ -807,7 +810,13 @@ mod tests {
         }
 
         fn query(&self, _drive_id: u32, file_id: u32) -> (u32, proto::drive::Entry) {
-            (0, Self::entry(&self.files.lock().unwrap()[&file_id].0))
+            let files = self.files.lock().unwrap();
+            let f = &files[&file_id];
+            // As Windows: reading the attributes needs FILE_READ_ATTRIBUTES.
+            if !f.2 {
+                return (0xC000_0022, Default::default());
+            }
+            (0, Self::entry(&f.0))
         }
 
         fn set_basic(
@@ -842,7 +851,7 @@ mod tests {
             if delete && f.0.is_dir() && std::fs::read_dir(&f.0).unwrap().next().is_some() {
                 return 0xC000_0101;
             }
-            f.2 = delete;
+            f.3 = delete;
             0
         }
 
@@ -1530,8 +1539,14 @@ mod tests {
             .read_to_string(&mut pt)
             .unwrap();
         assert_eq!(&pt, ticket);
-        assert!(zip.by_name("Documents/1/Pages/1.fpage").is_ok());
-        // Its temporary files are gone.
+        // The text as outlines (curves), not as rectangles.
+        let mut page = String::new();
+        zip.by_name("Documents/1/Pages/1.fpage")
+            .unwrap()
+            .read_to_string(&mut page)
+            .unwrap();
+        assert!(page.contains(" C "), "text not drawn as outlines");
+        // Its temporary files are gone (the PDF and the socket stay).
         let left: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
