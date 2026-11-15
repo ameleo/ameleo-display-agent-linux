@@ -25,6 +25,7 @@ use tokio::net::UnixListener;
 use zbus::proxy::CacheProperties;
 
 use super::Shared;
+use super::agents::host_call;
 use super::printcaps::{Caps, job_options};
 
 /// The device URI scheme of our queues: the backend's name.
@@ -50,6 +51,8 @@ pub struct Printers {
     /// CUPS changes, one at a time and in order.
     cups: tokio::sync::Mutex<()>,
     next_job: AtomicU32,
+    /// `AddPrinter` calls whose queue is being made.
+    pending: std::sync::atomic::AtomicUsize,
 }
 
 /// Runs a CUPS command; its output, or its error.
@@ -109,7 +112,8 @@ fn queue_name(name: &str) -> String {
             q.push('_');
         }
     }
-    let q: String = q.trim_matches(['_', '.']).chars().take(100).collect();
+    // Never `-` first: the name goes to CUPS commands as an argument.
+    let q: String = q.trim_matches(['_', '.', '-']).chars().take(100).collect();
     if q.is_empty() {
         "client-printer".into()
     } else {
@@ -158,15 +162,20 @@ impl Printers {
             "client printer options"
         );
         let this = self.clone();
+        this.pending.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _cups = this.cups.lock().await;
-            // The same printer again, or one of the last session's.
+            // The same printer of this session again, or one of the last
+            // session's by its name (ids are the host's, per session).
             let reused = {
                 let mut list = this.list.lock().unwrap();
-                let at = list.iter().position(|p| p.id == id).or_else(|| {
-                    list.iter()
-                        .position(|p| p.orphan.is_some() && p.name == name)
-                });
+                let at = list
+                    .iter()
+                    .position(|p| p.id == id && p.orphan.is_none())
+                    .or_else(|| {
+                        list.iter()
+                            .position(|p| p.orphan.is_some() && p.name == name)
+                    });
                 at.map(|i| list.remove(i))
             };
             let queue = match &reused {
@@ -231,6 +240,7 @@ impl Printers {
                     }
                 }
             }
+            this.pending.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
@@ -287,7 +297,9 @@ impl Printers {
                 .position(|p| p.id == id && p.orphan.is_some())
                 .map(|i| list.remove(i))
         };
-        if let Some(p) = p {
+        if let Some(mut p) = p {
+            // This runs in that task: aborting it would stop the deletion.
+            p.orphan = None;
             delete(p).await;
         }
     }
@@ -307,6 +319,8 @@ impl Printers {
                 .lock()
                 .unwrap()
                 .iter()
+                // The last session's stay unusable until deleted.
+                .filter(|p| p.orphan.is_none())
                 .map(|p| (p.queue.clone(), p.is_default))
                 .collect();
             for (q, is_default) in printers {
@@ -331,8 +345,16 @@ impl Printers {
     }
 
     /// Printers, those waiting for the next session included.
+    /// Printers of this session, those being installed included.
     pub fn count(&self) -> usize {
-        self.list.lock().unwrap().len()
+        let installed = self
+            .list
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.orphan.is_none())
+            .count();
+        installed + self.pending.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -376,6 +398,10 @@ async fn install(
             "ameleo client",
             "-o",
             "printer-is-shared=false",
+            // A failed job must not stop the queue: the user could not
+            // start it again.
+            "-o",
+            "printer-error-policy=abort-job",
             "-u",
             &allow,
         ],
@@ -448,14 +474,6 @@ async fn lp_uid() -> Option<u32> {
         .ok()
 }
 
-/// A host call, with a timeout.
-async fn call<T>(f: impl std::future::Future<Output = zbus::Result<T>>) -> Result<T> {
-    tokio::time::timeout(super::CALL_TIMEOUT, f)
-        .await
-        .map_err(|_| Error::Failed("the host did not answer".into()))?
-        .map_err(|e| Error::Failed(e.to_string()))
-}
-
 /// What the CUPS backend calls.
 pub struct PrintIface(Arc<Shared>);
 
@@ -465,6 +483,7 @@ impl PrintIface {
     /// `options` the CUPS job options.
     async fn submit(
         &self,
+        #[zbus(connection)] backend: &zbus::Connection,
         queue: &str,
         title: &str,
         user: &str,
@@ -513,8 +532,9 @@ impl PrintIface {
             size,
             "client printer job"
         );
-        call(proxy.begin_job(printer_id, job, "application/oxps", title, user, &ticket)).await?;
-        let sent: Result<()> = async {
+        host_call(proxy.begin_job(printer_id, job, "application/oxps", title, user, &ticket))
+            .await?;
+        let sending = async {
             let mut buf = vec![0u8; proto::printer::CHUNK_MAX];
             loop {
                 let n = out
@@ -523,14 +543,19 @@ impl PrintIface {
                 if n == 0 {
                     break;
                 }
-                call(proxy.write_job(job, buf[..n].to_vec())).await?;
+                host_call(proxy.write_job(job, buf[..n].to_vec())).await?;
             }
             tokio::time::timeout(END_JOB_TIMEOUT, proxy.end_job(job))
                 .await
                 .map_err(|_| Error::Failed("the host did not take the job".into()))?
                 .map_err(|e| Error::Failed(e.to_string()))
-        }
-        .await;
+        };
+        // The backend goes away when CUPS cancels the job: the host drops
+        // it too.
+        let sent: Result<()> = tokio::select! {
+            r = sending => r,
+            _ = backend.closed() => Err(Error::Failed("the job was cancelled".into())),
+        };
         match &sent {
             Ok(()) => tracing::info!(job, "client printer job sent"),
             Err(e) => {
@@ -554,5 +579,6 @@ mod tests {
         );
         assert_eq!(queue_name("Imprimante d'Éric"), "Imprimante_d_ric");
         assert_eq!(queue_name("///"), "client-printer");
+        assert_eq!(queue_name("-x printer"), "x_printer");
     }
 }

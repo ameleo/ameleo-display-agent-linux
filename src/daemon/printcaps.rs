@@ -219,6 +219,8 @@ fn parse(xml: &str) -> Result<Parsed, String> {
     let mut opt_display = String::new();
     let mut opt_size: (Option<u32>, Option<u32>) = (None, None);
     let mut feat_display = String::new();
+    // The top-level feature being read: options outside one are not its.
+    let mut feature: Option<usize> = None;
     loop {
         let before = reader.buffer_position() as usize;
         let ev = reader.read_event().map_err(|e| e.to_string())?;
@@ -244,13 +246,17 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                         end: after,
                     });
                     feat_display.clear();
+                    feature = (is(&kind, "Feature") && !empty).then(|| parsed.elements.len() - 1);
                 }
-                if depth == 2 && is(&kind, "Option") {
+                if depth == 2
+                    && is(&kind, "Option")
+                    && let Some(f) = feature
+                {
                     opt_display.clear();
                     opt_size = (None, None);
                     if empty {
                         parsed.options.push((
-                            parsed.elements.len() - 1,
+                            f,
                             name.clone(),
                             String::new(),
                             (before, after),
@@ -300,18 +306,24 @@ fn parse(xml: &str) -> Result<Parsed, String> {
                         _ => {}
                     }
                 }
-                if depth == 2 && local == "Option" && !parsed.elements.is_empty() {
+                if depth == 2
+                    && local == "Option"
+                    && let Some(f) = feature
+                {
                     let size = match opt_size {
                         (Some(w), Some(h)) => Some((w, h)),
                         _ => None,
                     };
                     parsed.options.push((
-                        parsed.elements.len() - 1,
+                        f,
                         name,
                         std::mem::take(&mut opt_display),
                         (start, after),
                         size,
                     ));
+                }
+                if depth == 1 {
+                    feature = None;
                 }
                 if depth == 1 && !parsed.elements.is_empty() {
                     let i = parsed.elements.len() - 1;
@@ -710,7 +722,7 @@ impl Caps {
         if matches!(
             options.get("orientation-requested").map(String::as_str),
             Some("4" | "5")
-        ) || options.get("landscape").is_some()
+        ) || options.get("landscape").is_some_and(|v| v != "false")
         {
             extra.push(self.feature_xml(
                 &QName::psk("PageOrientation"),
@@ -747,6 +759,25 @@ impl Caps {
             match t.elements.iter().find(|e| {
                 e.kind.local == "Feature" && e.name.as_ref() == Some(&QName::psk("PageOrientation"))
             }) {
+                Some(e) => cuts.push((e.start, e.end, x)),
+                None => added.push_str(&x),
+            }
+        }
+        // Copies the backend was left to make.
+        if let Some(n) = options
+            .get("ameleo-copies")
+            .and_then(|n| n.parse::<u32>().ok())
+            .filter(|&n| n > 1)
+        {
+            let name = QName::psk("JobCopiesAllDocuments");
+            let x = format!(
+                "<psf:ParameterInit xmlns:psf=\"{PSF}\" xmlns:psk=\"{PSK}\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" name=\"psk:JobCopiesAllDocuments\"><psf:Value xsi:type=\"xsd:integer\">{n}</psf:Value></psf:ParameterInit>"
+            );
+            match t
+                .elements
+                .iter()
+                .find(|e| e.kind.local == "ParameterInit" && e.name.as_ref() == Some(&name))
+            {
                 Some(e) => cuts.push((e.start, e.end, x)),
                 None => added.push_str(&x),
             }
@@ -1102,6 +1133,36 @@ pub(crate) mod tests {
         let t = caps.ticket(&job_options("landscape"));
         assert!(t.contains("psk:Landscape"));
         assert!(parse(&t).is_ok());
+    }
+
+    #[test]
+    fn options_outside_features() {
+        // An option under a property, first and after a feature: neither
+        // panics nor joins the feature.
+        let caps = CAPS.replace(
+            "<psf:Feature name=\"psk:PageMediaSize\">",
+            "<psf:Property name=\"psk:Odd\"><psf:Option name=\"psk:Stray\"/></psf:Property><psf:Feature name=\"psk:PageMediaSize\">",
+        );
+        let caps = caps.replace(
+            "<psf:ParameterDef",
+            "<psf:Property name=\"psk:Odd2\"><psf:Option name=\"psk:Stray2\"/></psf:Property><psf:ParameterDef",
+        );
+        let c = Caps::new(&caps, TICKET).unwrap();
+        for f in &c.features {
+            assert!(
+                f.options.iter().all(|o| !o.name.local.starts_with("Stray")),
+                "{f:?}"
+            );
+        }
+        // Copies left to the backend go to the driver.
+        let t = c.ticket(&job_options("ameleo-copies=3"));
+        assert!(t.contains(
+            "name=\"psk:JobCopiesAllDocuments\"><psf:Value xsi:type=\"xsd:integer\">3</psf:Value>"
+        ));
+        assert!(parse(&t).is_ok());
+        // nolandscape is portrait.
+        let t = c.ticket(&job_options("nolandscape"));
+        assert!(!t.contains("Landscape"));
     }
 
     #[test]

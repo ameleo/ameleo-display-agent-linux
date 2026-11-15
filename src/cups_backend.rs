@@ -43,17 +43,40 @@ pub async fn run(args: &[String]) -> i32 {
         eprintln!("Usage: ameleo-display-agent cups-backend job user title copies options [file]");
         return FAILED;
     }
-    match print(args).await {
-        Ok(()) => OK,
-        Err(e) => {
-            eprintln!("ERROR: {e}");
+    // CUPS cancels a job with SIGTERM: the job is dropped, and with it
+    // the temporary files, Ghostscript and the connection (the daemon then
+    // aborts the job on the host).
+    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        return FAILED;
+    };
+    tokio::select! {
+        r = print(args) => match r {
+            Ok(()) => OK,
+            Err(e) => {
+                eprintln!("ERROR: {e}");
+                FAILED
+            }
+        },
+        _ = term.recv() => {
+            eprintln!("INFO: Job cancelled");
             FAILED
         }
     }
 }
 
 async fn print(args: &[String]) -> Result<(), String> {
-    let (job, user, title, options) = (&args[0], &args[1], &args[2], &args[4]);
+    let (job, user, title) = (&args[0], &args[1], &args[2]);
+    // Given a file, the backend makes the copies (CUPS's filters made them
+    // otherwise): the driver is asked for them.
+    let mut options = args[4].clone();
+    if args.get(5).is_some()
+        && let Ok(copies) = args[3].parse::<u32>()
+        && copies > 1
+    {
+        options.push_str(&format!(" ameleo-copies={copies}"));
+    }
+    let options = &options;
     let uri = std::env::var("DEVICE_URI").map_err(|_| "no DEVICE_URI")?;
     let queue = uri
         .strip_prefix("ameleo:")
@@ -128,6 +151,7 @@ async fn gs(device: &str, extra: &[&str], input: &Path, output: &Path) -> Result
         .args(extra)
         .arg(format!("-sOutputFile={}", output.display()))
         .arg(input)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("Ghostscript (gs): {e}"))?;

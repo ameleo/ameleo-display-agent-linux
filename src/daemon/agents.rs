@@ -190,7 +190,9 @@ impl DaemonIface {
 }
 
 /// A call to the host, with a timeout; its errors as `Failed`.
-async fn host_call<T>(call: impl std::future::Future<Output = zbus::Result<T>>) -> Result<T> {
+pub(super) async fn host_call<T>(
+    call: impl std::future::Future<Output = zbus::Result<T>>,
+) -> Result<T> {
     tokio::time::timeout(CALL_TIMEOUT, call)
         .await
         .map_err(|_| Error::Failed(format!("no answer within {CALL_TIMEOUT:?}")))?

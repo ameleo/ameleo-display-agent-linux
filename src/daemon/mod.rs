@@ -883,7 +883,7 @@ mod tests {
     /// ticket, document, ended)`.
     type FakeJob = (u32, u32, String, String, String, Vec<u8>, bool);
     #[derive(Clone, Default)]
-    struct FakePrinters(Arc<Mutex<Vec<FakeJob>>>);
+    struct FakePrinters(Arc<Mutex<Vec<FakeJob>>>, Arc<Mutex<Vec<u32>>>);
 
     #[zbus::interface(name = "fr.ameleo.Host.Printer1")]
     impl FakePrinters {
@@ -906,16 +906,25 @@ mod tests {
                 false,
             ));
         }
-        fn write_job(&self, job_id: u32, data: Vec<u8>) {
-            let mut jobs = self.0.lock().unwrap();
-            let j = jobs.iter_mut().find(|j| j.1 == job_id).unwrap();
-            j.5.extend(data);
+        /// A job titled `slow` takes a second per chunk.
+        async fn write_job(&self, job_id: u32, data: Vec<u8>) {
+            let slow = {
+                let mut jobs = self.0.lock().unwrap();
+                let j = jobs.iter_mut().find(|j| j.1 == job_id).unwrap();
+                j.5.extend(data);
+                j.3 == "slow"
+            };
+            if slow {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
         fn end_job(&self, job_id: u32) {
             let mut jobs = self.0.lock().unwrap();
             jobs.iter_mut().find(|j| j.1 == job_id).unwrap().6 = true;
         }
-        fn abort_job(&self, _job_id: u32) {}
+        fn abort_job(&self, job_id: u32) {
+            self.1.lock().unwrap().push(job_id);
+        }
         fn document_properties(&self, _p: u32, _r: u32, _t: &str) {}
     }
 
@@ -1547,6 +1556,68 @@ mod tests {
             .unwrap();
         assert!(page.contains(" C "), "text not drawn as outlines");
         // Its temporary files are gone (the PDF and the socket stay).
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+
+        // CUPS cancels a job: it kills the backend, the host drops the job.
+        let big = dir.join("big.pdf");
+        let ok = std::process::Command::new("gs")
+            .args(["-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite"])
+            .arg(format!("-sOutputFile={}", big.display()))
+            .args([
+                "-c",
+                "1 1 30 { pop 0 1 500 { 0 moveto 600 800 rlineto stroke } for showpage } for",
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let mut backend = tokio::process::Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/ameleo-display-agent"
+        ))
+        .arg("cups-backend")
+        .args(["14", "mike", "slow", "1", ""])
+        .arg(&big)
+        .env("DEVICE_URI", "ameleo:/Test_Printer")
+        .env("TMPDIR", &dir)
+        .env("AMELEO_DISPLAY_AGENT_PRINT_SOCKET", &sock)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+        let fake = printer.get().await;
+        let (jobs, aborted) = (fake.0.clone(), fake.1.clone());
+        drop(fake);
+        for _ in 0..300 {
+            if jobs.lock().unwrap().iter().any(|j| j.3 == "slow") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // As CUPS does.
+        let pid = rustix::process::Pid::from_raw(backend.id().unwrap() as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        let _ = backend.wait().await;
+        for _ in 0..100 {
+            if !aborted.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let slow = jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|j| j.3 == "slow")
+            .cloned()
+            .unwrap();
+        assert_eq!(*aborted.lock().unwrap(), [slow.1], "the job is aborted");
+        assert!(!slow.6, "and not ended");
+        let _ = std::fs::remove_file(&big);
+        // The backend left nothing behind.
         let left: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
