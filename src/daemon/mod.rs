@@ -23,8 +23,8 @@ use crate::channel::port::{Port, PortEvent};
 use crate::channel::transport;
 use agents::Agent;
 use host::{
-    AgentIface, CameraIface, ClipboardIface, DisplayIface, FileClipboardIface, FileTransferIface,
-    MouseIface,
+    AgentIface, CameraIface, ClipboardIface, DisplayIface, DriveIface, FileClipboardIface,
+    FileTransferIface, MouseIface,
 };
 use mouse::MouseHandle;
 
@@ -85,6 +85,12 @@ pub struct CameraInfo {
     pub streaming: bool,
 }
 
+/// A client drive, kept to be mounted in the next active session.
+pub struct DriveInfo {
+    pub name: String,
+    pub label: String,
+}
+
 /// What a camera tells the host.
 pub enum CameraSignal {
     /// `StreamRequested(format)`, or `StreamStopped`.
@@ -134,6 +140,8 @@ pub struct Shared {
     guest_released: AtomicBool,
     /// The client cameras, by id.
     cameras: Mutex<std::collections::BTreeMap<u32, CameraInfo>>,
+    /// The client drives, by id.
+    drives: Mutex<std::collections::BTreeMap<u32, DriveInfo>>,
     effects: Mutex<Effects>,
     transfers: Mutex<HashMap<u32, Transfer>>,
     next_transfer: AtomicU32,
@@ -161,6 +169,7 @@ impl Shared {
             host_grab: Mutex::new(None),
             guest_released: AtomicBool::new(false),
             cameras: Mutex::new(Default::default()),
+            drives: Mutex::new(Default::default()),
             effects: Mutex::new(Effects::load()),
             transfers: Mutex::new(HashMap::new()),
             next_transfer: AtomicU32::new(0),
@@ -184,6 +193,7 @@ impl Shared {
         self.transfers.lock().unwrap().clear();
         // The agents remove theirs with the reset.
         self.cameras.lock().unwrap().clear();
+        self.drives.lock().unwrap().clear();
         self.max_clipboard.store(-1, Ordering::Relaxed);
         self.mouse.send(mouse::Cmd::ReleaseAll);
         for agent in self.agents.lock().unwrap().iter() {
@@ -373,6 +383,7 @@ async fn clip_forwarder(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Cli
                 if let Some(old) = old {
                     let _ = old.session().await.clipboard_release().await;
                     let _ = old.camera().camera_remove_all().await;
+                    let _ = old.drive().drive_remove_all().await;
                 }
                 // The cameras move to the new user's session: its apps
                 // have not started them yet.
@@ -394,6 +405,24 @@ async fn clip_forwarder(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Cli
                     for (id, name, formats, _) in cameras {
                         if let Err(e) = new.camera().camera_add(id, &name, formats).await {
                             tracing::warn!(id, agent = new.id, "camera not added: {e}");
+                        }
+                    }
+                    // The drives too, for the new user only.
+                    let drives: Vec<_> = shared
+                        .drives
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(&id, d)| (id, d.name.clone(), d.label.clone()))
+                        .collect();
+                    for (id, name, label) in drives {
+                        match new.drive().drive_add(id, &name, &label).await {
+                            Ok(path) => {
+                                tracing::info!(id, path, agent = new.id, "client drive mounted")
+                            }
+                            Err(e) => {
+                                tracing::warn!(id, agent = new.id, "client drive not mounted: {e}")
+                            }
                         }
                     }
                 }
@@ -545,6 +574,7 @@ async fn build(split: transport::Split, shared: Arc<Shared>) -> zbus::Result<Con
         .serve_at(AGENT_PATH, ClipboardIface(shared.clone()))?
         .serve_at(AGENT_PATH, FileClipboardIface(shared.clone()))?
         .serve_at(AGENT_PATH, CameraIface(shared.clone()))?
+        .serve_at(AGENT_PATH, DriveIface(shared.clone()))?
         .serve_at(AGENT_PATH, DisplayIface(shared.clone()))?
         .serve_at(AGENT_PATH, FileTransferIface(shared))?
         .build()
@@ -602,6 +632,192 @@ mod tests {
         }
     }
 
+    /// A client drive: a temporary directory, as a Windows client's
+    /// RDPDR would serve it.
+    #[derive(Default)]
+    struct FakeDrive {
+        root: std::path::PathBuf,
+        /// Open files: path, file (not for folders), delete on close.
+        files: std::sync::Mutex<HashMap<u32, FakeOpen>>,
+        next: AtomicU32,
+    }
+
+    type FakeOpen = (std::path::PathBuf, Option<std::fs::File>, bool);
+
+    const NOT_FOUND: u32 = 0xC000_0034;
+    const COLLISION: u32 = 0xC000_0035;
+
+    impl FakeDrive {
+        fn path(&self, p: &str) -> std::path::PathBuf {
+            self.root.join(p.replace('\\', "/"))
+        }
+
+        fn entry(path: &std::path::Path) -> proto::drive::Entry {
+            let m = std::fs::metadata(path).unwrap();
+            let t = |t: std::io::Result<std::time::SystemTime>| {
+                t.ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| 116_444_736_000_000_000 + (d.as_nanos() / 100) as u64)
+            };
+            let readonly = m.permissions().readonly() as u32;
+            (
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                if m.is_dir() { 0x10 } else { 0x20 } | readonly,
+                if m.is_dir() { 0 } else { m.len() },
+                t(m.created()),
+                t(m.accessed()),
+                t(m.modified()),
+                t(m.modified()),
+            )
+        }
+    }
+
+    #[zbus::interface(name = "fr.ameleo.Host.Drive1")]
+    impl FakeDrive {
+        #[allow(clippy::too_many_arguments)]
+        fn open(
+            &self,
+            _drive_id: u32,
+            path: &str,
+            access: u32,
+            _attributes: u32,
+            _share: u32,
+            disposition: u32,
+            options: u32,
+        ) -> (u32, u32, u32) {
+            let full = self.path(path);
+            let exists = full.exists();
+            let dir = options & 1 != 0 || full.is_dir();
+            let information = match (disposition, exists) {
+                (1 | 4, false) => return (NOT_FOUND, 0, 0),
+                (2, true) => return (COLLISION, 0, 0),
+                (1 | 3, true) => 1,
+                (4 | 5, true) => 3,
+                _ => 2,
+            };
+            if dir && !exists {
+                std::fs::create_dir(&full).unwrap();
+            }
+            let file = (!dir).then(|| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(access & 0x4000_0000 != 0)
+                    .create(!exists)
+                    .truncate(information == 3)
+                    .open(&full)
+                    .unwrap()
+            });
+            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+            self.files.lock().unwrap().insert(id, (full, file, false));
+            (0, id, information)
+        }
+
+        fn close(&self, _drive_id: u32, file_id: u32) -> u32 {
+            if let Some((path, _, true)) = self.files.lock().unwrap().remove(&file_id) {
+                if path.is_dir() {
+                    std::fs::remove_dir(path).unwrap();
+                } else {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            0
+        }
+
+        fn read(&self, _drive_id: u32, file_id: u32, offset: u64, length: u32) -> (u32, Vec<u8>) {
+            use std::os::unix::fs::FileExt;
+            let files = self.files.lock().unwrap();
+            let f = files[&file_id].1.as_ref().unwrap();
+            let mut buf = vec![0; length as usize];
+            let n = f.read_at(&mut buf, offset).unwrap();
+            if n == 0 && length > 0 {
+                return (0xC000_0011, Vec::new());
+            }
+            buf.truncate(n);
+            (0, buf)
+        }
+
+        fn write(&self, _drive_id: u32, file_id: u32, offset: u64, data: Vec<u8>) -> (u32, u32) {
+            use std::os::unix::fs::FileExt;
+            let files = self.files.lock().unwrap();
+            files[&file_id]
+                .1
+                .as_ref()
+                .unwrap()
+                .write_all_at(&data, offset)
+                .unwrap();
+            (0, data.len() as u32)
+        }
+
+        fn flush(&self, _drive_id: u32, _file_id: u32) -> u32 {
+            0
+        }
+
+        fn query(&self, _drive_id: u32, file_id: u32) -> (u32, proto::drive::Entry) {
+            (0, Self::entry(&self.files.lock().unwrap()[&file_id].0))
+        }
+
+        fn set_basic(
+            &self,
+            _drive_id: u32,
+            file_id: u32,
+            attributes: u32,
+            _c: u64,
+            _a: u64,
+            _w: u64,
+        ) -> u32 {
+            if attributes != 0 {
+                let path = self.files.lock().unwrap()[&file_id].0.clone();
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_readonly(attributes & 1 != 0);
+                std::fs::set_permissions(path, perms).unwrap();
+            }
+            0
+        }
+
+        fn set_size(&self, _drive_id: u32, file_id: u32, size: u64, allocation: bool) -> u32 {
+            if !allocation {
+                let files = self.files.lock().unwrap();
+                files[&file_id].1.as_ref().unwrap().set_len(size).unwrap();
+            }
+            0
+        }
+
+        fn set_delete(&self, _drive_id: u32, file_id: u32, delete: bool) -> u32 {
+            let mut files = self.files.lock().unwrap();
+            let f = files.get_mut(&file_id).unwrap();
+            if delete && f.0.is_dir() && std::fs::read_dir(&f.0).unwrap().next().is_some() {
+                return 0xC000_0101;
+            }
+            f.2 = delete;
+            0
+        }
+
+        fn rename(&self, _drive_id: u32, file_id: u32, new_path: &str, replace: bool) -> u32 {
+            let to = self.path(new_path);
+            if !replace && to.exists() {
+                return COLLISION;
+            }
+            let mut files = self.files.lock().unwrap();
+            let f = files.get_mut(&file_id).unwrap();
+            std::fs::rename(&f.0, &to).unwrap();
+            f.0 = to;
+            0
+        }
+
+        fn list(&self, _drive_id: u32, path: &str) -> (u32, Vec<proto::drive::Entry>) {
+            match std::fs::read_dir(self.path(path)) {
+                Ok(d) => (0, d.map(|e| Self::entry(&e.unwrap().path())).collect()),
+                Err(_) => (NOT_FOUND, Vec::new()),
+            }
+        }
+
+        fn volume(&self, _drive_id: u32) -> (u32, u64, u64, String, String) {
+            (0, 1 << 30, 1 << 29, "TEST".into(), "NTFS".into())
+        }
+    }
+
     async fn host_client(shared: Arc<Shared>) -> Connection {
         let (g_out_tx, mut g_out_rx) = mpsc::channel(64);
         let (c_out_tx, mut c_out_rx) = mpsc::channel(64);
@@ -631,6 +847,15 @@ mod tests {
             .serve_at(
                 proto::HOST_PATH,
                 FakeHostFiles("hello from the host".into()),
+            )
+            .unwrap()
+            .serve_at(
+                proto::HOST_PATH,
+                FakeDrive {
+                    root: std::env::temp_dir()
+                        .join(format!("ada-client-drive-{}", std::process::id())),
+                    ..Default::default()
+                },
             )
             .unwrap()
             .build()
@@ -993,5 +1218,145 @@ mod tests {
         let _ = std::process::Command::new("wl-copy")
             .arg("--clear")
             .status();
+    }
+
+    /// A client drive mounted by a session agent, used through the mount:
+    /// needs /dev/fuse and fusermount3.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn client_drive() {
+        let (shared, clip_rx) = Shared::new(MouseHandle::detached(), None);
+        tokio::spawn(clip_forwarder(shared.clone(), clip_rx));
+        let host = host_client(shared.clone()).await;
+        let client = std::env::temp_dir().join(format!("ada-client-drive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&client);
+        std::fs::create_dir_all(client.join("docs")).unwrap();
+        std::fs::write(client.join("docs/readme.txt"), b"from the client").unwrap();
+
+        *shared.active.lock().unwrap() = logind::Active {
+            id: "1".into(),
+            uid: Some(rustix::process::getuid().as_raw()),
+            locked: false,
+        };
+        let (a, b) = tokio::net::UnixStream::pair().unwrap();
+        tokio::spawn(agents::serve(shared.clone(), 1, a));
+        let _agent = crate::session::test_agent(b, None).await;
+        for _ in 0..100 {
+            if shared.current().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let drive = proto::DriveProxy::builder(&host)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .unwrap();
+        let mount = std::path::PathBuf::from(drive.add_drive(4, "C", "C on test").await.unwrap());
+        assert!(mount.ends_with("C on test"), "{}", mount.display());
+
+        let m = mount.clone();
+        let c = client.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            // Read a client file.
+            assert_eq!(
+                std::fs::read(m.join("docs/readme.txt")).unwrap(),
+                b"from the client"
+            );
+            assert!(std::fs::metadata(m.join("missing")).is_err());
+            // Write a new one, larger than one request, and append.
+            let big: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+            std::fs::write(m.join("docs/big.bin"), &big).unwrap();
+            assert_eq!(std::fs::read(c.join("docs/big.bin")).unwrap(), big);
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(m.join("docs/readme.txt"))
+                .unwrap();
+            f.write_all(b"!").unwrap();
+            drop(f);
+            assert_eq!(
+                std::fs::read(c.join("docs/readme.txt")).unwrap(),
+                b"from the client!"
+            );
+            // Folders, renames, listing, truncation.
+            std::fs::create_dir(m.join("new")).unwrap();
+            std::fs::rename(m.join("docs/big.bin"), m.join("new/moved.bin")).unwrap();
+            assert!(c.join("new/moved.bin").exists());
+            let mut names: Vec<_> = std::fs::read_dir(m.join("new"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["moved.bin"]);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(m.join("new/moved.bin"))
+                .unwrap()
+                .set_len(10)
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(m.join("new/moved.bin")).unwrap().len(),
+                10
+            );
+            // A file saved by replacing it, as editors do.
+            std::fs::write(m.join("docs/.readme.tmp"), b"saved").unwrap();
+            std::fs::rename(m.join("docs/.readme.tmp"), m.join("docs/readme.txt")).unwrap();
+            assert_eq!(std::fs::read(m.join("docs/readme.txt")).unwrap(), b"saved");
+            // Read-only, as the client's attribute.
+            let mut p = std::fs::metadata(m.join("docs/readme.txt"))
+                .unwrap()
+                .permissions();
+            p.set_readonly(true);
+            std::fs::set_permissions(m.join("docs/readme.txt"), p).unwrap();
+            assert!(
+                std::fs::metadata(c.join("docs/readme.txt"))
+                    .unwrap()
+                    .permissions()
+                    .readonly()
+            );
+            let mut p = std::fs::metadata(m.join("docs/readme.txt"))
+                .unwrap()
+                .permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(false);
+            std::fs::set_permissions(m.join("docs/readme.txt"), p).unwrap();
+            // Deletions; a folder with files stays.
+            assert!(std::fs::remove_dir(m.join("new")).is_err());
+            std::fs::remove_file(m.join("new/moved.bin")).unwrap();
+            std::fs::remove_dir(m.join("new")).unwrap();
+            assert!(!c.join("new").exists());
+            // Volume size.
+            let st = rustix::fs::statvfs(&m).unwrap();
+            assert_eq!(st.f_blocks * st.f_frsize, 1 << 30);
+        })
+        .await
+        .unwrap();
+
+        // A change made on the client shows at once.
+        std::fs::write(client.join("docs/later.txt"), b"x").unwrap();
+        drive
+            .changed(
+                4,
+                vec![(proto::drive::action::ADDED, "docs\\later.txt".into())],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let m = mount.clone();
+        tokio::task::spawn_blocking(move || assert!(m.join("docs/later.txt").exists()))
+            .await
+            .unwrap();
+
+        drive.remove_drive(4).await.unwrap();
+        for _ in 0..100 {
+            if !mount.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!mount.exists(), "unmounted and removed");
+        std::fs::remove_dir_all(&client).unwrap();
     }
 }

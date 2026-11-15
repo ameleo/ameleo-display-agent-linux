@@ -8,13 +8,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use proto::{Error, HostClipboardProxy, HostFileClipboardProxy, Result};
+use proto::{Error, HostClipboardProxy, HostDriveProxy, HostFileClipboardProxy, Result};
 use tokio::net::UnixListener;
 use zbus::Connection;
 use zbus::proxy::CacheProperties;
 
 use super::{CALL_TIMEOUT, CameraSignal, Effects, Shared};
-use crate::ipc::{DAEMON_PATH, Head, SessionCameraProxy, SessionProxy};
+use crate::ipc::{DAEMON_PATH, Head, SessionCameraProxy, SessionDriveProxy, SessionProxy};
 
 pub struct Agent {
     pub id: u64,
@@ -22,6 +22,7 @@ pub struct Agent {
     conn: OnceLock<Connection>,
     /// Its cameras, built once: a frame is sent per proxy call.
     camera: OnceLock<SessionCameraProxy<'static>>,
+    drive: OnceLock<SessionDriveProxy<'static>>,
     /// The monitors of its session.
     pub layout: Mutex<Vec<Head>>,
 }
@@ -41,6 +42,12 @@ impl Agent {
 
     pub fn camera(&self) -> &SessionCameraProxy<'static> {
         self.camera
+            .get()
+            .expect("agent registered after its connection")
+    }
+
+    pub fn drive(&self) -> &SessionDriveProxy<'static> {
+        self.drive
             .get()
             .expect("agent registered after its connection")
     }
@@ -105,6 +112,7 @@ pub(super) async fn serve(
         uid,
         conn: OnceLock::new(),
         camera: OnceLock::new(),
+        drive: OnceLock::new(),
         layout: Mutex::new(Vec::new()),
     });
     let conn = zbus::connection::Builder::unix_stream(stream)
@@ -117,6 +125,13 @@ pub(super) async fn serve(
                 agent: agent.clone(),
             },
         )?
+        .serve_at(
+            DAEMON_PATH,
+            HostDriveIface {
+                shared: shared.clone(),
+                agent: agent.clone(),
+            },
+        )?
         .build()
         .await?;
     let _ = agent.conn.set(conn.clone());
@@ -125,6 +140,11 @@ pub(super) async fn serve(
         .build()
         .await?;
     let _ = agent.camera.set(camera);
+    let drive = SessionDriveProxy::builder(&conn)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await?;
+    let _ = agent.drive.set(drive);
     tracing::info!(agent = id, uid, "session agent connected");
 
     agent.send_effects(*shared.effects.lock().unwrap());
@@ -279,5 +299,157 @@ impl DaemonIface {
             }
         }
         res.map_err(|e| Error::NoData(e.to_string()))
+    }
+}
+
+/// `Host.Drive1` for the active agent: its FUSE file systems' requests,
+/// passed on as they are. Methods run concurrently, as the host takes them.
+pub struct HostDriveIface {
+    shared: Arc<Shared>,
+    agent: Arc<Agent>,
+}
+
+impl HostDriveIface {
+    /// The host's `Drive1`, when this agent may use drive `id`.
+    async fn host(&self, id: u32) -> Result<HostDriveProxy<'static>> {
+        if !self.shared.current().is_some_and(|a| a.id == self.agent.id) {
+            return Err(Error::Failed("not the active session".into()));
+        }
+        if !self.shared.drives.lock().unwrap().contains_key(&id) {
+            return Err(Error::NotFound(format!("no client drive {id}")));
+        }
+        let conn = self
+            .shared
+            .host()
+            .ok_or_else(|| Error::Failed("no host session".into()))?;
+        Ok(HostDriveProxy::builder(&conn)
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?)
+    }
+}
+
+#[zbus::interface(name = "fr.ameleo.DisplayAgent.HostDrive1")]
+impl HostDriveIface {
+    #[allow(clippy::too_many_arguments)]
+    async fn open(
+        &self,
+        drive_id: u32,
+        path: &str,
+        desired_access: u32,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+    ) -> Result<(u32, u32, u32)> {
+        let p = self.host(drive_id).await?;
+        host_call(p.open(
+            drive_id,
+            path,
+            desired_access,
+            file_attributes,
+            share_access,
+            create_disposition,
+            create_options,
+        ))
+        .await
+    }
+
+    async fn close(&self, drive_id: u32, file_id: u32) -> Result<u32> {
+        let p = self.host(drive_id).await?;
+        host_call(p.close(drive_id, file_id)).await
+    }
+
+    async fn read(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        offset: u64,
+        length: u32,
+    ) -> Result<(u32, Vec<u8>)> {
+        let p = self.host(drive_id).await?;
+        host_call(p.read(drive_id, file_id, offset, length.min(proto::drive::IO_MAX))).await
+    }
+
+    async fn write(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(u32, u32)> {
+        if data.len() > proto::drive::IO_MAX as usize {
+            return Err(Error::InvalidArgument("write larger than IO_MAX".into()));
+        }
+        let p = self.host(drive_id).await?;
+        host_call(p.write(drive_id, file_id, offset, data)).await
+    }
+
+    async fn flush(&self, drive_id: u32, file_id: u32) -> Result<u32> {
+        let p = self.host(drive_id).await?;
+        host_call(p.flush(drive_id, file_id)).await
+    }
+
+    async fn query(&self, drive_id: u32, file_id: u32) -> Result<(u32, proto::drive::Entry)> {
+        let p = self.host(drive_id).await?;
+        host_call(p.query(drive_id, file_id)).await
+    }
+
+    async fn set_basic(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        attributes: u32,
+        creation_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
+    ) -> Result<u32> {
+        let p = self.host(drive_id).await?;
+        host_call(p.set_basic(
+            drive_id,
+            file_id,
+            attributes,
+            creation_time,
+            last_access_time,
+            last_write_time,
+        ))
+        .await
+    }
+
+    async fn set_size(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        size: u64,
+        allocation: bool,
+    ) -> Result<u32> {
+        let p = self.host(drive_id).await?;
+        host_call(p.set_size(drive_id, file_id, size, allocation)).await
+    }
+
+    async fn set_delete(&self, drive_id: u32, file_id: u32, delete: bool) -> Result<u32> {
+        let p = self.host(drive_id).await?;
+        host_call(p.set_delete(drive_id, file_id, delete)).await
+    }
+
+    async fn rename(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        new_path: &str,
+        replace: bool,
+    ) -> Result<u32> {
+        let p = self.host(drive_id).await?;
+        host_call(p.rename(drive_id, file_id, new_path, replace)).await
+    }
+
+    async fn list(&self, drive_id: u32, path: &str) -> Result<(u32, Vec<proto::drive::Entry>)> {
+        let p = self.host(drive_id).await?;
+        host_call(p.list(drive_id, path)).await
+    }
+
+    async fn volume(&self, drive_id: u32) -> Result<(u32, u64, u64, String, String)> {
+        let p = self.host(drive_id).await?;
+        host_call(p.volume(drive_id)).await
     }
 }

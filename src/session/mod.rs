@@ -7,11 +7,13 @@
 
 pub(crate) mod camera;
 mod clipboard;
+mod drives;
 mod effects;
 pub(crate) mod filelist;
 mod filexfer;
 mod gnome;
 mod hostfiles;
+mod places;
 mod wayland;
 
 use std::io::Write;
@@ -70,6 +72,8 @@ struct State {
     next_lock: AtomicU32,
     /// The client cameras; unset without PipeWire.
     cameras: OnceLock<camera::Cameras>,
+    /// The client drives; unset without a home directory.
+    drives: OnceLock<Arc<drives::Drives>>,
 }
 
 impl State {
@@ -87,6 +91,7 @@ impl State {
             pasted: tokio::sync::Mutex::new(None),
             next_lock: AtomicU32::new(0),
             cameras: OnceLock::new(),
+            drives: OnceLock::new(),
         }
     }
 
@@ -384,7 +389,85 @@ impl SessionIface {
         if let Some(cameras) = self.0.cameras.get() {
             cameras.remove_all();
         }
+        if let Some(drives) = self.0.drives.get() {
+            drives.remove_all();
+        }
         self.clipboard_release().await;
+    }
+}
+
+struct DriveIface(Arc<State>);
+
+/// `spawn = false`: changes come after the drive was mounted.
+#[zbus::interface(name = "fr.ameleo.DisplayAgent.Drive1", spawn = false)]
+impl DriveIface {
+    async fn drive_add(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        id: u32,
+        name: &str,
+        label: &str,
+    ) -> proto::Result<String> {
+        let host = crate::ipc::HostDriveProxy::builder(conn)
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?;
+        let drives = self
+            .0
+            .drives
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::Failed("no client drives in this session".into()))?;
+        let (name, label) = (name.to_string(), label.to_string());
+        tokio::task::spawn_blocking(move || drives.add(host, id, &name, &label))
+            .await
+            .map_err(|e| Error::Failed(e.to_string()))?
+            .map(|p| p.display().to_string())
+            .map_err(Error::Failed)
+    }
+
+    fn drive_remove(&self, id: u32) {
+        if let Some(drives) = self.0.drives.get() {
+            drives.remove(id);
+        }
+    }
+
+    fn drive_remove_all(&self) {
+        if let Some(drives) = self.0.drives.get() {
+            drives.remove_all();
+        }
+    }
+
+    fn drive_changed(&self, id: u32, changes: Vec<proto::drive::Change>) {
+        if let Some(drives) = self.0.drives.get() {
+            drives.changed(id, &changes);
+        }
+    }
+}
+
+/// The client drives, ready before the daemon may ask for one; what a
+/// killed agent left is cleaned up first.
+async fn start_drives(state: &State, root: Option<PathBuf>, places: Option<PathBuf>) {
+    let Some(root) = root else {
+        tracing::warn!("no home directory: no client drives");
+        return;
+    };
+    let drives = tokio::task::spawn_blocking(move || drives::Drives::new(root, places))
+        .await
+        .expect("no panic");
+    let _ = state.drives.set(Arc::new(drives));
+}
+
+/// Unmounts the client drives and waits until they are.
+async fn stop_drives(state: &State) {
+    if let Some(drives) = state.drives.get() {
+        let pending = drives.remove_all();
+        let _ = tokio::task::spawn_blocking(move || {
+            for t in pending {
+                let _ = t.join();
+            }
+        })
+        .await;
     }
 }
 
@@ -560,11 +643,14 @@ pub async fn run() -> Result<()> {
         Err(e) => tracing::warn!("no client cameras: {e:#}"),
     }
 
+    start_drives(&state, drives::default_root(), places::default_file()).await;
+
     let stream = connect_daemon().await;
     let conn = zbus::connection::Builder::unix_stream(stream)
         .p2p()
         .serve_at(SESSION_PATH, SessionIface(state.clone()))?
         .serve_at(SESSION_PATH, CameraIface(state.clone()))?
+        .serve_at(SESSION_PATH, DriveIface(state.clone()))?
         .build()
         .await?;
     let daemon = DaemonProxy::builder(&conn)
@@ -606,9 +692,14 @@ pub async fn run() -> Result<()> {
                     }
                 }
             },
-            _ = conn.closed() => anyhow::bail!("the daemon closed the connection"),
+            _ = conn.closed() => {
+                // The drives cannot reach the client anymore.
+                stop_drives(&state).await;
+                anyhow::bail!("the daemon closed the connection");
+            }
             _ = sigterm.recv() => {
                 tracing::info!("stopping");
+                stop_drives(&state).await;
                 return Ok(());
             }
         }
@@ -672,9 +763,13 @@ pub async fn test_agent(
     guest: Option<Vec<String>>,
 ) -> zbus::Connection {
     let state = Arc::new(State::new(Clip::None, guest));
+    let drives = std::env::temp_dir().join(format!("ada-drives-{}", std::process::id()));
+    start_drives(&state, Some(drives), None).await;
     let conn = zbus::connection::Builder::unix_stream(stream)
         .p2p()
         .serve_at(SESSION_PATH, SessionIface(state.clone()))
+        .unwrap()
+        .serve_at(SESSION_PATH, DriveIface(state.clone()))
         .unwrap()
         .build()
         .await

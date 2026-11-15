@@ -11,7 +11,8 @@
 //!   what the host asks of the user's desktop (clipboard, files, effects);
 //! * the daemon serves [`DAEMON_PATH`] (`fr.ameleo.DisplayAgent.Daemon1`):
 //!   what the desktop tells the host (clipboard changes, pastes of host
-//!   data, the monitor layout for the pointer).
+//!   data, the monitor layout for the pointer), and
+//!   `fr.ameleo.DisplayAgent.HostDrive1`: the client drives' files.
 //!
 //! Only the agent of the active session of seat0 gets host requests.
 
@@ -141,6 +142,88 @@ pub trait SessionCamera {
     /// One H.264 access unit.
     #[zbus(no_reply)]
     fn camera_frame(&self, id: u32, data: Vec<u8>) -> zbus::Result<()>;
+}
+
+/// The client drives of the session agent, on [`SESSION_PATH`].
+#[zbus::proxy(
+    interface = "fr.ameleo.DisplayAgent.Drive1",
+    default_service = "fr.ameleo.DisplayAgent.Session",
+    default_path = "/fr/ameleo/DisplayAgent/Session",
+    gen_blocking = false
+)]
+pub trait SessionDrive {
+    /// Mounts client drive `id`; returns its mount point.
+    fn drive_add(&self, id: u32, name: &str, label: &str) -> zbus::Result<String>;
+    fn drive_remove(&self, id: u32) -> zbus::Result<()>;
+    fn drive_remove_all(&self) -> zbus::Result<()>;
+    /// Changes made on the client, see `proto::Drive::changed`.
+    fn drive_changed(&self, id: u32, changes: Vec<proto::drive::Change>) -> zbus::Result<()>;
+}
+
+/// `Host.Drive1`, through the daemon, on [`DAEMON_PATH`]: the same methods,
+/// for the active agent only. A D-Bus error means the client could not be
+/// asked (see `proto::HostDrive`).
+#[zbus::proxy(
+    interface = "fr.ameleo.DisplayAgent.HostDrive1",
+    default_service = "fr.ameleo.DisplayAgent.Daemon",
+    default_path = "/fr/ameleo/DisplayAgent/Daemon",
+    gen_blocking = false
+)]
+pub trait HostDrive {
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        &self,
+        drive_id: u32,
+        path: &str,
+        desired_access: u32,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+    ) -> zbus::Result<(u32, u32, u32)>;
+    fn close(&self, drive_id: u32, file_id: u32) -> zbus::Result<u32>;
+    fn read(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        offset: u64,
+        length: u32,
+    ) -> zbus::Result<(u32, Vec<u8>)>;
+    fn write(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> zbus::Result<(u32, u32)>;
+    fn flush(&self, drive_id: u32, file_id: u32) -> zbus::Result<u32>;
+    fn query(&self, drive_id: u32, file_id: u32) -> zbus::Result<(u32, proto::drive::Entry)>;
+    fn set_basic(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        attributes: u32,
+        creation_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
+    ) -> zbus::Result<u32>;
+    fn set_size(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        size: u64,
+        allocation: bool,
+    ) -> zbus::Result<u32>;
+    fn set_delete(&self, drive_id: u32, file_id: u32, delete: bool) -> zbus::Result<u32>;
+    fn rename(
+        &self,
+        drive_id: u32,
+        file_id: u32,
+        new_path: &str,
+        replace: bool,
+    ) -> zbus::Result<u32>;
+    fn list(&self, drive_id: u32, path: &str) -> zbus::Result<(u32, Vec<proto::drive::Entry>)>;
+    fn volume(&self, drive_id: u32) -> zbus::Result<(u32, u64, u64, String, String)>;
 }
 
 /// An error of the other side, as the protocol error it was.

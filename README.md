@@ -28,7 +28,7 @@ spice-vdagent have:
 | Role | Role in the guest |
 |---|---|
 | `ameleo-display-agent daemon` | The system service, run as root: the port, the host's D-Bus session, the pointer and the session lock |
-| `ameleo-display-agent session` | The session agent, run as the user in each graphical session: the clipboard, the monitor layout, files sent by the host and the desktop effects |
+| `ameleo-display-agent session` | The session agent, run as the user in each graphical session: the clipboard, the monitor layout, the client cameras and drives, files sent by the host and the desktop effects |
 
 The modules of `src`, by feature:
 
@@ -37,7 +37,7 @@ The modules of `src`, by feature:
 | `main`, `ipc` | The entry point, and the private D-Bus interfaces between the daemon and the session agents |
 | `channel/` | The virtio-serial port and the D-Bus sessions on it |
 | `daemon/` | The host's interfaces, the uinput pointer, logind and the session agents |
-| `session/` | The clipboard (Wayland or GNOME Shell), the file clipboard, the client cameras (PipeWire), the monitors, file transfer and desktop effects |
+| `session/` | The clipboard (Wayland or GNOME Shell), the file clipboard, the client cameras (PipeWire), the client drives (FUSE), the monitors, file transfer and desktop effects |
 
 `gnome-shell-extension/` holds the GNOME Shell extension that gives the clipboard to the agent
 on GNOME, and `packaging/` the systemd units and the udev rule.
@@ -53,7 +53,8 @@ make
 
 At run time, the client cameras need PipeWire and the Cisco OpenH264 library (Fedora: the
 `openh264` package, from the `fedora-cisco-openh264` repository that Fedora enables by default),
-version 2.6 or later. Without it, the agent works, but `AddCamera` fails.
+version 2.6 or later. Without it, the agent works, but `AddCamera` fails. The file clipboard and
+the client drives need FUSE 3 (`/dev/fuse` and `fusermount3`, from the `fuse3` package).
 
 ## Installing in the guest
 
@@ -107,6 +108,7 @@ sudo AMELEO_DISPLAY_AGENT_LOG=debug ameleo-display-agent daemon
 |---|---|---|
 | `AMELEO_DISPLAY_AGENT_LOG` | `info` | The `tracing` filter, such as `debug` or `debug,ameleo_display_agent::daemon::host=trace` (to see pointer events) |
 | `AMELEO_DISPLAY_AGENT_CAMERA_DUMP` | unset | A directory where the session agent saves each client camera's H.264 stream as it comes (`camera-<id>.h264`), to look into a camera problem |
+| `AMELEO_DISPLAY_AGENT_DRIVES` | `~/client-drives` | The folder where the session agent mounts the client drives |
 | `AMELEO_DISPLAY_AGENT_SOCKET` | `/run/ameleo-display-agent/session.sock` | The socket between the daemon and the session agents, for development |
 
 To set them for the services, use `systemctl edit` and add `Environment=` lines under
@@ -129,8 +131,9 @@ interfaces for hosts. This section describes how this agent implements them in L
   whether the session is locked. On `Agent1.Reset`, it locks that session.
 * **Session agents.** Each graphical session runs a session agent as its user. It connects to
   the daemon on `/run/ameleo-display-agent/session.sock`, with a peer-to-peer D-Bus connection:
-  the daemon serves `fr.ameleo.DisplayAgent.Daemon1`, and the session agent serves
-  `fr.ameleo.DisplayAgent.Session1` (see `src/ipc.rs`).
+  the daemon serves `fr.ameleo.DisplayAgent.Daemon1` and `fr.ameleo.DisplayAgent.HostDrive1`,
+  and the session agent serves `fr.ameleo.DisplayAgent.Session1`, `fr.ameleo.DisplayAgent.Camera1`
+  and `fr.ameleo.DisplayAgent.Drive1` (see `src/ipc.rs`).
 * **One user.** The daemon knows the user of each session agent from the socket. Only the agent
   of the user in front of the screen gets the host's requests; the agents of other users get
   nothing.
@@ -216,6 +219,32 @@ PipeWire or the camera portal list it, such as Firefox, Chromium, OBS and GNOME 
 * **Controls.** The agent accepts `SetControls` and `ControlValue`, but does not show the camera
   controls in the guest yet.
 
+### Drives
+
+Each client drive becomes a folder of `~/client-drives`, named after the drive's label (`C on
+PC-CLIENT`); `AddDrive` returns its path. GNOME Files shows it in its sidebar, as it does for
+mounts in the home folder. On Plasma, the agent adds it to the Places of Dolphin and the file
+dialogs (`~/.local/share/user-places.xbel`) and removes it with the drive: Dolphin's Devices
+list only disks and a few network file systems.
+
+* **FUSE.** The session agent mounts each drive as a FUSE file system of the user, which other
+  users cannot see. Every operation of a guest app becomes one call of `Host.Drive1`, through
+  the daemon: nothing of the client's files is copied into the guest. The open goes to the
+  client with sharing for everyone, since Linux apps do not ask for sharing modes, so the
+  client's file system decides on existing files and folders.
+* **Attributes.** A file the client marks read-only shows without write permission, and
+  `chmod` sets or clears that attribute. Files and folders belong to the user.
+* **Caches.** RDPDR gives one directory entry per round trip, so the agent trusts what the
+  client said of a file or a folder for 5 seconds. The client's changes (`Changed`) and the
+  user's own changes through the drive drop what the agent knew at once.
+* **Sessions.** The drives are mounted in the session of the user in front of the screen. When
+  another user's session becomes active, they move to it.
+* **End.** `RemoveDrive`, `Agent1.Reset` and stopping the session agent unmount the drives, even
+  while an app still uses them: the app then gets errors. A session agent that was killed
+  leaves its mounts behind; the next one unmounts them.
+
+Without FUSE, `AddDrive` fails; the rest works.
+
 ### File transfer
 
 * Files are saved in the user's Downloads folder (`XDG_DOWNLOAD_DIR`), as the user. When the
@@ -246,6 +275,7 @@ setting.
 | Absolute mouse through uinput, multiple monitors | Same, with the layout of the Wayland compositors, HiDPI and fractional scaling, plus the horizontal wheel and high resolution scrolling |
 | Clipboard text and images, on X11 and partly on Wayland | Text, PNG and BMP on Wayland: GNOME, Plasma and wlroots |
 | Clipboard file lists through spice-webdavd | Replaced by the MS-RDPECLIP file clipboard, both ways, without webdavd: host files are read on demand through FUSE |
+| Folder sharing through spice-webdavd | Replaced by the client drives (MS-RDPEFS), mounted with FUSE |
 | File transfer to Downloads, `name (n).ext` | Same, with flow control through method replies; refused while the session is locked |
 | Reset when the client disconnects | `Agent1.Reset()`, which also locks the session, done implicitly on every new session |
 | Monitor configuration | **Left out on purpose**: the layout belongs to the display driver and the compositor |
@@ -253,7 +283,7 @@ setting.
 
 ## Not supported yet
 
-* Client printers and client drives. The agent does not list them in `Agent1.Channels`.
+* Client printers. The agent does not list them in `Agent1.Channels`.
 * Camera controls (brightness, focus, zoom...) in the guest.
 * X11 sessions, and the clipboard on the login screen.
 * Distribution packages (RPM and deb).

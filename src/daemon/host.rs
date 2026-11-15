@@ -51,6 +51,7 @@ impl AgentIface {
             iface::FILE_CLIPBOARD,
             iface::DISPLAY,
             iface::CAMERA,
+            iface::DRIVE,
             iface::FILE_TRANSFER,
         ]
         .into_iter()
@@ -430,5 +431,78 @@ impl FileTransferIface {
         self.0
             .transfer(id)
             .ok_or_else(|| Error::NotFound(format!("transfer {id}")))
+    }
+}
+
+pub struct DriveIface(pub Arc<Shared>);
+
+/// Longest wait for a session agent to mount a drive.
+const DRIVE_ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Client drives: mounted in the active session with FUSE. Their files go
+/// from the session agent to `Host.Drive1` through the daemon
+/// ([`super::agents`]).
+#[zbus::interface(name = "fr.ameleo.Agent.Drive1")]
+impl DriveIface {
+    /// Returns the mount point, or `""` when no user session is in front
+    /// of the screen: the drive is mounted in the next one.
+    async fn add_drive(&self, id: u32, name: &str, label: &str) -> Result<String> {
+        tracing::info!(id, name, label, "AddDrive");
+        if name.len() > 255 || label.len() > 255 {
+            return Err(Error::InvalidArgument("name or label too long".into()));
+        }
+        {
+            let mut drives = self.0.drives.lock().unwrap();
+            if !drives.contains_key(&id) && drives.len() >= proto::drive::MAX_DRIVES as usize {
+                return Err(Error::Failed(format!(
+                    "at most {} client drives",
+                    proto::drive::MAX_DRIVES
+                )));
+            }
+            drives.insert(
+                id,
+                super::DriveInfo {
+                    name: name.to_string(),
+                    label: label.to_string(),
+                },
+            );
+        }
+        let Some(agent) = self.0.current() else {
+            return Ok(String::new());
+        };
+        let res = tokio::time::timeout(DRIVE_ADD_TIMEOUT, agent.drive().drive_add(id, name, label))
+            .await
+            .map_err(|_| Error::Failed("the session agent did not answer".into()))
+            .and_then(|r| r.map_err(to_proto));
+        match &res {
+            Ok(path) => tracing::info!(id, path, "client drive mounted"),
+            Err(e) => {
+                tracing::warn!(id, "client drive not mounted: {e}");
+                self.0.drives.lock().unwrap().remove(&id);
+            }
+        }
+        res
+    }
+
+    async fn remove_drive(&self, id: u32) {
+        tracing::info!(id, "RemoveDrive");
+        if self.0.drives.lock().unwrap().remove(&id).is_none() {
+            return;
+        }
+        if let Some(agent) = self.0.current()
+            && let Err(e) = agent.drive().drive_remove(id).await
+        {
+            tracing::warn!(id, "client drive not unmounted: {e}");
+        }
+    }
+
+    async fn changed(&self, id: u32, changes: Vec<proto::drive::Change>) {
+        tracing::debug!(id, count = changes.len(), "client drive changes");
+        if !self.0.drives.lock().unwrap().contains_key(&id) {
+            return;
+        }
+        if let Some(agent) = self.0.current() {
+            let _ = agent.drive().drive_changed(id, changes).await;
+        }
     }
 }
