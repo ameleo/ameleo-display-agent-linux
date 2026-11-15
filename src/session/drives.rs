@@ -354,7 +354,9 @@ impl DriveFs {
         Ok(entries)
     }
 
-    /// Opens `path` on the client: `(file id, information)`.
+    /// Opens `path` on the client: `(file id, information)`. The
+    /// attributes may always be read, as the file system asks for them
+    /// after an open (Windows gives that right with `GENERIC_READ` only).
     async fn open(
         &self,
         path: &str,
@@ -368,7 +370,7 @@ impl DriveFs {
             .open(
                 self.id,
                 path,
-                access,
+                access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                 attributes,
                 SHARE_ALL,
                 disposition,
