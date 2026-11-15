@@ -52,6 +52,8 @@ make
 if [ $1 -eq 1 ]; then
     # Every graphical session starts the session agent.
     systemctl --global enable ameleo-display-agent-session.service >/dev/null 2>&1 || :
+    # A daemon installed before (make deploy) runs the new binary.
+    systemctl try-restart ameleo-display-agent.service >/dev/null 2>&1 || :
 fi
 # The daemon starts when the agent port appears (udev), or restarts on the new binary.
 udevadm control --reload >/dev/null 2>&1 || :
