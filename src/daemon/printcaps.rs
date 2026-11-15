@@ -77,8 +77,10 @@ pub struct Caps {
     pub margins: [f64; 4],
 }
 
-/// Margins when the driver tells none: 12 pt (4.2 mm), what most
-/// printers need.
+/// The smallest margin: 12 pt (4.2 mm), what most printers need, and the
+/// margin when the driver tells none. Many Linux apps (Qt ones among them)
+/// print the document from the printer's margins on: with the 0 a PDF
+/// printer gives, the text would touch the edge of the page.
 const DEFAULT_MARGIN: f64 = 12.0;
 
 /// The integer value of the property `local` (any prefix), in `xml`.
@@ -447,7 +449,9 @@ impl Caps {
     pub fn new(capabilities: &str, default_ticket: &str) -> Result<Self, String> {
         let mut caps = Caps {
             ticket: default_ticket.to_string(),
-            margins: margins(capabilities).unwrap_or([DEFAULT_MARGIN; 4]),
+            margins: margins(capabilities)
+                .unwrap_or_default()
+                .map(|m| m.max(DEFAULT_MARGIN)),
             ..Default::default()
         };
         if capabilities.trim().is_empty() {
@@ -728,7 +732,7 @@ impl Caps {
         let mut cuts: Vec<(usize, usize, String)> = Vec::new();
         let mut added = String::new();
         for (f, o) in &chosen {
-            let new = self.feature_xml(&f.name, &o.xml, false);
+            let new = self.feature_xml(&f.name, &ticket_option(&o.xml), false);
             match t
                 .elements
                 .iter()
@@ -800,6 +804,71 @@ impl Caps {
     }
 }
 
+/// An option of the capabilities as a ticket has it: without what only
+/// capabilities say (`constrained`, display names). A driver refuses a
+/// ticket with them: Microsoft Print to PDF wrote an empty file.
+fn ticket_option(xml: &str) -> String {
+    use quick_xml::events::BytesStart;
+    use quick_xml::writer::Writer;
+    let local =
+        |name: &[u8]| -> Vec<u8> { name.rsplit(|&b| b == b':').next().unwrap_or(name).to_vec() };
+    let clean = |e: &BytesStart| -> BytesStart<'static> {
+        let mut out = BytesStart::new(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+        for a in e.attributes().flatten() {
+            if local(a.key.as_ref()) != b"constrained" {
+                out.push_attribute(a);
+            }
+        }
+        out
+    };
+    // A psf:Property for display: psk:DisplayName.
+    let display = |e: &BytesStart| {
+        local(e.name().as_ref()) == b"Property"
+            && attr(e, "name").is_some_and(|n| n.ends_with(":DisplayName"))
+    };
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut w = Writer::new(Vec::new());
+    let mut skip = 0usize;
+    loop {
+        let ev = match reader.read_event() {
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(ev) => ev,
+        };
+        let res = match ev {
+            Event::Start(e) => {
+                if skip > 0 || display(&e) {
+                    skip += 1;
+                    continue;
+                }
+                w.write_event(Event::Start(clean(&e)))
+            }
+            Event::Empty(e) => {
+                if skip > 0 || display(&e) {
+                    continue;
+                }
+                w.write_event(Event::Empty(clean(&e)))
+            }
+            Event::End(e) => {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                w.write_event(Event::End(e))
+            }
+            ev if skip > 0 => {
+                let _ = ev;
+                continue;
+            }
+            ev => w.write_event(ev),
+        };
+        if res.is_err() {
+            return xml.to_string();
+        }
+    }
+    String::from_utf8(w.into_inner()).unwrap_or_else(|_| xml.to_string())
+}
+
 /// CUPS job options (`argv[5]` of a backend): `name=value` and `name`
 /// (true), separated by spaces, with quotes and backslashes.
 pub fn job_options(s: &str) -> HashMap<String, String> {
@@ -849,7 +918,7 @@ pub(crate) mod tests {
   <psf:Feature name="psk:PageMediaSize">
     <psf:Property name="psf:SelectionType"><psf:Value xsi:type="xsd:QName">psk:PickOne</psf:Value></psf:Property>
     <psf:Property name="psk:DisplayName"><psf:Value xsi:type="xsd:string">Taille du papier</psf:Value></psf:Property>
-    <psf:Option name="psk:ISOA4">
+    <psf:Option name="psk:ISOA4" constrained="psk:None">
       <psf:Property name="psk:DisplayName"><psf:Value xsi:type="xsd:string">A4</psf:Value></psf:Property>
       <psf:ScoredProperty name="psk:MediaSizeWidth"><psf:Value xsi:type="xsd:integer">210000</psf:Value></psf:ScoredProperty>
       <psf:ScoredProperty name="psk:MediaSizeHeight"><psf:Value xsi:type="xsd:integer">297000</psf:Value></psf:ScoredProperty>
@@ -956,6 +1025,20 @@ pub(crate) mod tests {
             text.contains("*ImageableArea A4: \"18.00 12.00 577.28 829.89\"\n"),
             "{text}"
         );
+        // A printer without margins gets the smallest ones.
+        let pdf = CAPS
+            .replace(">6350<", ">0<")
+            .replace(">203200<", ">215900<");
+        let pdf_text: String = Caps::new(&pdf, TICKET)
+            .unwrap()
+            .ppd("PDF")
+            .iter()
+            .map(|&b| b as char)
+            .collect();
+        assert!(
+            pdf_text.contains("*ImageableArea A4: \"12.00 12.00 583.28 829.89\"\n"),
+            "{pdf_text}"
+        );
         assert!(text.contains("*Duplex DuplexNoTumble/Recto verso: \"\"\n"));
         assert!(text.contains("*OpenUI *EconoMode/Mode économique: PickOne\n"));
         assert!(text.contains("*ModelName: \"HP LaserJet  bureau\"\n"));
@@ -979,6 +1062,13 @@ pub(crate) mod tests {
         assert!(t.starts_with("<?xml"));
         assert!(!t.contains("b:NorthAmericaLetter"));
         assert!(t.contains("<psf:Option name=\"psk:ISOA4\">"));
+        if std::env::var_os("AMELEO_SHOW_TICKET").is_some() {
+            eprintln!("{t}");
+        }
+        // Nothing that only capabilities say: drivers refuse the ticket.
+        assert!(!t.contains("constrained"), "{t}");
+        assert!(!t.contains("DisplayName"), "{t}");
+        assert!(t.contains("<psf:Value xsi:type=\"xsd:integer\">210000</psf:Value>"));
         assert!(t.contains("name=\"psk:TwoSidedLongEdge\""));
         assert!(t.contains("name=\"ns0000:Off\""));
         assert!(t.contains("name=\"psk:Landscape\""));

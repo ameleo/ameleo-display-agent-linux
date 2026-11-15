@@ -260,7 +260,9 @@ client's name as its description), so every print dialog lists it.
   two-sided printing, color, trays, media types and the driver's own features, with the
   display names the driver gives and the defaults of its default PrintTicket. The standard
   ones use CUPS's names (`PageSize`, `Duplex`, `ColorModel`, `InputSlot`...), so the dialogs
-  show them in their usual places. CUPS itself makes the copies, n-up and page ranges.
+  show them in their usual places. CUPS itself makes the copies, n-up and page ranges. The
+  margins are the driver's (`psk:PageImageableSize`), at least 4.2 mm: many Linux apps lay the
+  document out from the printer's margins, and a PDF printer has none.
 * **Jobs.** CUPS gives each job as PDF to the agent's `ameleo` backend, which it runs as `lp`.
   The backend makes an XPS document of it with Ghostscript, in two passes since `xpswrite`
   cannot write fonts: the text first becomes vector outlines (`pdfwrite` with `NoOutputFonts`),
